@@ -2,115 +2,132 @@
 
 Research project exploring vertical LLM inference partitioning between edge and cloud devices to reduce edge compute while maintaining/reducing latency.
 
-## configuration
+## Configuration
 
 Edge inference settings live in `config.py`. In particular:
 
-- Set `speculative_decoding` to `True` to use batched draft verification, or
-  `False` to use the original token-by-token path.
-- Set `prefill_edge_layers` and `decode_edge_layers` to the edge layer counts
-  for prompt processing and token decoding. They must satisfy
-  `0 < prefill_edge_layers <= decode_edge_layers < total_layers`.
-- `chunked_prefill=True` divides prompts into `prefill_chunk_size` token
-  chunks (64 by default). `kv_transfer_dtype` is currently restricted to
-  exact FP16 and transfers are synchronous.
+- Set `speculative_decoding` to `True` to use batched draft verification, or `False` to use the original token-by-token path.
+- Set `prefill_edge_layers` and `decode_edge_layers` to the edge layer counts for prompt processing and token decoding. They must satisfy `0 < prefill_edge_layers <= decode_edge_layers < total_layers`.
+- `chunked_prefill=True` divides prompts into `prefill_chunk_size` token chunks (64 by default). `kv_transfer_dtype` is currently restricted to exact FP16 and transfers are synchronous.
 - Set `num_draft_tokens` to the maximum speculative block size.
-- Set `max_new_tokens`, or the `MAX_NEW_TOKENS` environment variable, to the
-  generation limit selected by the edge and sent to the cloud for each prompt.
-- Set `warmup_on_start` to `True` to warm the edge and cloud kernels before
-  accepting the first prompt.
-- Set `benchmark_enabled` to record per-generation and per-request metrics in
-  `benchmark_output` (default: `benchmarks/results.jsonl`).
+- Set `max_new_tokens`, or the `MAX_NEW_TOKENS` environment variable, to the generation limit selected by the edge and sent to the cloud for each prompt.
+- Set `warmup_on_start` to `True` to warm the edge and cloud kernels before accepting the first prompt.
+- Set `benchmark_enabled` to record per-generation and per-request metrics in `benchmark_output` (default: `benchmarks/results.jsonl`).
 
-Start the cloud server with `AUTH_TOKEN=<your-ngrok-token> python CLOUD.py`,
-then copy its printed Public URL into the edge process:
+Start the cloud server with `AUTH_TOKEN=<your-ngrok-token> python CLOUD.py`, then copy its printed Public URL into the edge process:
 
 ```bash
 CLOUD_URL=https://your-current-ngrok-url.ngrok-free.app python3 edge_client.py
 ```
 
-The edge model is loaded once and the process waits for prompts until `/quit`,
-`/exit`, EOF, or Ctrl-C. Each prompt receives fresh edge and cloud KV caches
-while the model weights and WebSocket connection remain resident.
+The edge model is loaded once and the process waits for prompts until `/quit`, `/exit`, EOF, or Ctrl-C. Each prompt receives fresh edge and cloud KV caches while the model weights and WebSocket connection remain resident.
 
-## benchmarking
+## Benchmarking
 
-When benchmarking is enabled, every prompt prints a short TTFT, inter-token
-latency, throughput, and byte-count summary. A full JSONL record is appended to
-`benchmarks/results.jsonl`, including:
+When benchmarking is enabled, every prompt prints a short TTFT, inter-token latency, throughput, and byte-count summary. A full JSONL record is appended to `benchmarks/results.jsonl`, including:
 
 - TTFT, inter-token latency distribution, total generation time, and tokens/s
-- edge forward, activation encoding, WebSocket, and cloud-forward timings
-- raw/encoded activation sizes, complete binary-frame sizes, and compression
-  ratio (TCP/TLS/WebSocket framing overhead is excluded)
-- edge process CPU/RAM and MPS allocation statistics
-- cloud CPU/RAM plus NVIDIA GPU utilization, memory, temperature, power, and
-  energy when NVML exposes them
-- speculative acceptance and response-chunk information
+- Edge forward, activation encoding, WebSocket, and cloud-forward timings
+- Raw/encoded activation sizes, complete binary-frame sizes, and compression ratio (TCP/TLS/WebSocket framing overhead is excluded)
+- Edge process CPU/RAM and MPS allocation statistics
+- Cloud CPU/RAM plus NVIDIA GPU utilization, memory, temperature, power, and energy when NVML exposes them
+- Speculative acceptance and response-chunk information
 
-On macOS, `powermetrics` energy sampling is best-effort and uses non-interactive
-`sudo -n`; if it is not already authorized, the JSON record marks edge energy
-as unsupported rather than prompting for a password or estimating a value.
+On macOS, `powermetrics` energy sampling is best-effort and uses non-interactive `sudo -n`; if it is not already authorized, the JSON record marks edge energy as unsupported rather than prompting for a password or estimating a value.
 
-## current implementation
+## Current Implementation
 
-disaggregated inference — edge device will compute the forward pass of the LLM
-up to first K layers. edge device will have its own KV cache. then, the hidden
-states will be sent up to the cloud, and forward pass for remaining N-K layers
-will be computed.
+Disaggregated inference—the edge device computes the LLM forward pass through the first K layers and maintains its own KV cache. The hidden states are then sent to the cloud, which computes the forward pass through the remaining N−K layers.
 
-<!-- ### cons of current implementation
-- every generated token costs one full round trip, edge device computes K layers -> network hop -> cloud computes N-K layers -> network hop back to edge device.
-- 2 network hops per token generated. from my measurements using T4 GPU on cloud and Apple M3 CPU on edge, took 4s to generate 10 tokens with Qwen 0.5B, which is incredibly slow.
-- using `Session` object; every call has the HTTP request overhead, with the usual sending headers and response. can be slow for every call, especially with autoregressive generation. -->
+<!-- ### Cons of Current Implementation
+- Every generated token costs one full round trip: the edge device computes K layers -> network hop -> the cloud computes N-K layers -> network hop back to the edge device.
+- Two network hops are required per generated token. In measurements using a T4 GPU in the cloud and an Apple M3 CPU on the edge, generating 10 tokens with Qwen 0.5B took 4 seconds.
+- Using a `Session` object means every call incurs HTTP request overhead, including the usual headers and response. This can be slow for autoregressive generation. -->
 
 
-## experiments/optimisations done
+## Experiments and Optimisations
 
-### network transport layer
+### Network Transport Layer
 
-initial implementation was using FP32 encoding + sending hidden states from edge to cloud via JSON (JSON-encoded float lists, each value sent as ASCII text, ~15-20 bytes/float). yeah i know, that's incredibly slow. 
+The initial implementation used FP32 encoding and sent hidden states from the edge to the cloud as JSON. Each value in the JSON-encoded float lists occupied approximately 15–20 ASCII bytes, making transfer extremely slow.
 
-replaced it with raw binary encoding of the activation tensor. further optimised it with quantisation; reduced per-value precision.
-- fp16: native half-precision float, halves bit-width.
-- int4: per-row scale computed as max(|row|) / 7, each value stored as a 4-bit signed integer (round(value / scale)), two values packed per byte. scale is sent alongside so the cloud side can dequantize (value ≈ int_value * scale).
+The JSON representation was replaced with raw binary encoding of the activation tensor and further optimised through reduced-precision quantisation.
+- FP16: Native half-precision floating point, which halves the bit width.
+- INT4: A per-row scale is calculated as max(|row|) / 7. Each value is stored as a 4-bit signed integer using round(value / scale), with two values packed per byte. The scale is sent alongside the payload so the cloud can dequantise it using value ≈ int_value × scale.
 
-<u>benchmark: 5-token boundary tensor, Qwen2.5-0.5B</u>
+<u>Benchmark: 5-token boundary tensor, Qwen2.5-0.5B</u>
 
 | Encoding | Bytes | vs. old JSON |
 |---|---|---|
 | Old: JSON float list | 92,613 | 1× |
-| New: binary, fp32 | 17,950 | 5.2× smaller |
-| New: binary, fp16 | 8,990 | 10.3× smaller |
-| New: binary, int4 | 2,290 | **40.4× smaller** |
+| New: binary, FP32 | 17,950 | 5.2× smaller |
+| New: binary, FP16 | 8,990 | 10.3× smaller |
+| New: binary, INT4 | 2,290 | **40.4× smaller** |
 
-### device-specific model residency
-each device only holds the portion of model that it is supposed to compute. for example, if K=4, edge device only holds 0 to K-1 layers, while the cloud device will hold K to N-1 layers.
+### Device-Specific Model Residency
+Each device only holds the portion of the model it is responsible for computing. For example, if K=4, the edge device holds layers 0 through K−1, while the cloud device holds layers K through N−1.
 
-this reduces resident device memory, as the unneeded layers are discarded from memory on each device.
+This reduces resident device memory because unneeded layers are discarded on each device.
 
-however, `load_partial_model()` loads the full model in entirety on each device into CPU, discards the unnecessary layers before moving it to MPS/CUDA. this reduces final device memory but not peak CPU loading memory.
+However, `load_partial_model()` first loads the entire model into CPU memory on each device, discards the unnecessary layers, and then moves the remaining layers to MPS/CUDA. This reduces final device memory usage but not peak CPU memory usage during loading.
 
-## decode vs prefill layer split
+## Decode vs. Prefill Layer Split
 
-during initial experiments, there was an even split of 14 layers between cloud vs edge. these were the results.
+During the initial experiments, the model was split evenly, with 14 layers on the edge and 14 layers in the cloud. These were the results:
 
 | Workload | Edge CPU (14 layers) | Cloud GPU (14 layers) | Ratio |
 |---|---:|---:|---:|
 | Single-token decode forward | 60–88 ms (mean ~68 ms) | 35.9–37.0 ms (mean ~36.8 ms) | ~1.9× cloud faster |
 | Prefill forward, per token (~88 tokens) | 28.5 ms/token | 0.91 ms/token | ~31× cloud faster |
 
-for decode, the margin between the GPU and CPU is pretty close, but it's very much different for prefill.
+For decode, the performance difference between the GPU and CPU is relatively small. The difference is substantially larger for prefill.
 
-this motivates using different split points by phase: assign fewer prefill layers to the edge and more to the cloud to exploit GPU parallelism, while choosing the decode split mainly around edge capacity, boundary-transfer cost, and per-token network latency. this also requires a re-working of the model residency logic between devices.
+This motivates using different split points by phase: assign fewer prefill layers to the edge and more to the cloud to exploit GPU parallelism, while choosing the decode split mainly around edge capacity, boundary-transfer cost, and per-token network latency. This also requires reworking the model-residency logic between devices.
+
+### First Dual-K Experiment
+
+The first experiment used `prefill_edge_layers=4`, `decode_edge_layers=12`, chunked prefill, synchronous FP16 KV migration, and CPU execution on the edge. Reducing edge prefill work improved time to first token (TTFT).
+
+| Metric | Fixed K=14, 88-token prompt | Dual-K 4/12, 96-token prompt | Observed change |
+|---|---:|---:|---:|
+| TTFT | 4137.7 ms | **3070.4 ms** | **−1067.3 ms (−25.8%)** |
+| Mean decode ITL | ~455 ms | **743.6 ms** | +288.6 ms (+63.4%) |
+| Decode ITL range | ~422–581 ms | **355–2425 ms** | Much less stable |
+
+Prefill was where the edge CPU had the largest disadvantage relative to the cloud GPU, so reducing edge prefill from 14 layers to 4 outweighed the added KV-migration cost.
+
+#### KV-Transfer Validation
+
+The first 64-token chunk transferred 1,048,792 bytes of KV frames, or approximately 16,387 bytes per prompt token. The predicted FP16 payload was:
+
+```text
+2,048 bytes/layer/token × 8 migrated layers = 16,384 bytes/token
+```
+
+The roughly three-byte-per-token difference is framing metadata. This closely matches the GQA-based transfer-cost model and confirms that only the intended new KV positions were migrated.
+
+#### Synchronous Migration Timing
+
+| Prompt chunk | Tokens | Round total | First KV arrival | Final KV arrival | Cloud prefill compute |
+|---|---:|---:|---:|---:|---:|
+| 0 | 64 | 1986.9 ms | 1555.2 ms | 1986.5 ms | ~106 ms |
+| 1 | 32 | 812.4 ms | 757.1 ms | 795.6 ms | ~106 ms |
+
+For the first chunk, the first KV frame arrived after 1555.2 ms, about 78% of the complete chunk round. KV extraction itself took only about 19 ms. The current implementation sends each layer's KV synchronously before computing the next layer, so CPU copying, serialisation, WebSocket/tunnel delay, and network transfer remain exposed in TTFT rather than overlapping subsequent cloud computation.
+
+The benchmark field `kv_migration_bandwidth_bytes_per_second` should not be interpreted as raw link bandwidth. It divides total KV bytes by complete prefill wall time, which also includes compute, queuing, serialization, and tunnel latency.
+
+#### Decode Instability
+
+The same run showed a decode regression: mean ITL increased from roughly 455 ms to 743.6 ms, with individual steps reaching 932 ms and 2425 ms. Telemetry during the spikes showed process RSS approaching 5.75 GB and system memory usage reaching 84.7%, so memory pressure is a plausible contributor.
 
 
-### speculative decoding 
-- use draft model, compute first K layers on edge device. draft up to N tokens each time, and send over to cloud device to verify.
-- on cloud device, verify the full pass (Initial Prompt Tokens + N newly generated tokens). from logits generated, verify if the N tokens match with the verifier model's prediction probability distributions. at the point where the verifier model disagrees with draft model, stop the chain, take the accepted tokens + bonus token and get draft model to generate N tokens again. 
-- faster than current implementation as this reduces the network hops done to the verifier model in cloud. potential con is if the draft model in edge device is bad and doesn't predict the tokens well as compared to verifier model. that will require calibration of parameters K and N.
-- from experiments, seems pretty useless. when trying with edge layers <= 20, acceptance rate for draft tokens is always <= 30%. if trying with edge layers = 24, acceptance rate is 100%, provides a modest improvement (3.1s vs 4.7s), but that's due to the reduced number of network trips (due to batched network requests), rather than the efficacy of speculative decoding.
+### Speculative Decoding
+- Use a draft model to compute the first K layers on the edge device. Draft up to N tokens at a time and send them to the cloud for verification.
+- In the cloud, verify the full pass consisting of the initial prompt tokens and N newly generated tokens. Use the resulting logits to determine whether the N draft tokens match the verifier model's predictions. When the verifier disagrees with the draft model, stop the chain, retain the accepted tokens plus the bonus token, and have the draft model generate another N tokens.
+- This can be faster than the standard implementation because it reduces network trips to the cloud verifier. A potential disadvantage is poor draft quality when the edge model uses too few layers, which requires calibration of K and N.
+- Experiments showed limited effectiveness. With 20 or fewer edge layers, the draft-token acceptance rate was at most 30%. With 24 edge layers, the acceptance rate reached 100% and provided a modest improvement (3.1 seconds versus 4.7 seconds), but this primarily resulted from fewer batched network requests rather than effective speculative decoding.
 
-**improvements**
-- for it to see tangible improvement, edge layers shd be reduced to less than 12, but not practical as the final LM head was not trained to decode intermediate representations reliably.
-- a meaningful improvement wld require training a separate auxillary early-exit head, or using a cheaper draft model and verify using larger model on cloud.
+**Improvements**
+- Achieving a tangible improvement would require fewer than 12 edge layers, but this is impractical because the final LM head was not trained to decode intermediate representations reliably.
+- A meaningful improvement would require training a separate auxiliary early-exit head or using a cheaper draft model and a larger cloud verifier model.
