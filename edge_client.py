@@ -7,15 +7,23 @@ from websockets.sync.client import connect
 
 import activation_codec as codec
 from config import CONFIG
+from model_loading import load_partial_model
 from spec_decoding import draft_and_prepare_verification, run_edge_layers
 
 
 tokenizer = AutoTokenizer.from_pretrained(CONFIG.model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    CONFIG.model_name,
-    torch_dtype=CONFIG.torch_dtype,
-)
-model.eval()
+if CONFIG.split_inference:
+    # Only the edge's own layer range + embed_tokens; no lm_head is needed
+    model = load_partial_model(
+        CONFIG.model_name, CONFIG.torch_dtype, CONFIG.device,
+        0, CONFIG.edge_layers, need_embed=True, need_lm_head=False,
+    )
+else:
+    # split_inference=False needs the complete model for a regular forward pass.
+    model = AutoModelForCausalLM.from_pretrained(
+        CONFIG.model_name, torch_dtype=CONFIG.torch_dtype,
+    ).to(CONFIG.device)
+    model.eval()
 
 
 def _read_reply(ws, unpack):
@@ -27,6 +35,7 @@ def _read_reply(ws, unpack):
 
 def _generate_standard(ws, input_ids, max_new_tokens):
     ws.send(codec.pack_session_start(CONFIG.edge_layers))
+    _read_reply(ws, codec.unpack_ok)
     edge_cache = DynamicCache()
     cur_ids = input_ids
     past_len = 0
@@ -138,7 +147,7 @@ def _generate_local(input_ids, max_new_tokens):
 
 def generate(prompt, max_new_tokens=None):
     max_new_tokens = max_new_tokens or CONFIG.max_new_tokens
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(CONFIG.device)
     started = time.perf_counter()
 
     if not CONFIG.split_inference:

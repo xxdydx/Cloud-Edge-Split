@@ -18,6 +18,7 @@ MSG_VERIFY = 3
 MSG_DECODE_REPLY = 4
 MSG_VERIFY_REPLY = 5
 MSG_ERROR = 6
+MSG_OK = 7
 
 DTYPE_FP32 = 0
 DTYPE_FP16 = 1
@@ -92,7 +93,9 @@ def encode_activation(hidden, dtype):
     raise ValueError(f"Unknown activation dtype: {dtype}")
 
 
-def decode_activation(payload, scales, dtype, seq_len, hidden_dim, device):
+def decode_activation(payload, scales, dtype, seq_len, hidden_dim, device, model_dtype=torch.float32):
+    """model_dtype is the receiving model's compute dtype, independent of the
+    wire dtype (`dtype`) the activation was quantized with for transport."""
     if dtype == "fp32":
         array = np.frombuffer(payload, dtype=np.float32)
         tensor = torch.from_numpy(array.copy()).reshape(1, seq_len, hidden_dim)
@@ -103,7 +106,7 @@ def decode_activation(payload, scales, dtype, seq_len, hidden_dim, device):
         tensor = _dequantize_int4(payload, scales, seq_len, hidden_dim)
     else:
         raise ValueError(f"Unknown activation dtype: {dtype}")
-    return tensor.to(device=device, dtype=torch.float32)
+    return tensor.to(device=device, dtype=model_dtype)
 
 
 # --- framing ------------------------------------------------------------
@@ -115,6 +118,14 @@ def pack_session_start(edge_layers):
 def unpack_session_start(data):
     _, edge_layers = struct.unpack(_SESSION_START_FMT, data)
     return edge_layers
+
+
+def pack_ok():
+    return bytes([MSG_OK])
+
+
+def unpack_ok(data):
+    return None
 
 
 def pack_decode(hidden, position_ids, dtype):

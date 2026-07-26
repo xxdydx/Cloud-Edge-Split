@@ -40,26 +40,34 @@ import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pyngrok import ngrok
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 import activation_codec as codec
+from model_loading import load_partial_model, num_hidden_layers
 
 
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-0.5B")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 DEVICE = os.getenv("DEVICE", "cuda")
+_DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+TORCH_DTYPE = _DTYPES[os.getenv("TORCH_DTYPE", "float16")]
+# Fixed split point this cloud instance is configured to serve — it only
+# ever loads layers[EDGE_LAYERS:], so it cannot serve any other value.
+EDGE_LAYERS = int(os.getenv("EDGE_LAYERS", "14"))
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.float32,
-).to(DEVICE)
-model.eval()
+TOTAL_LAYERS = num_hidden_layers(MODEL_NAME)
+# Only this device's own layer range + lm_head; no embed_tokens is needed
+# since the cloud never receives raw token ids, only hidden states.
+model = load_partial_model(
+    MODEL_NAME, TORCH_DTYPE, DEVICE,
+    EDGE_LAYERS, TOTAL_LAYERS, need_embed=False, need_lm_head=True,
+)
 layers = model.model.layers
 
 app = FastAPI()
@@ -111,14 +119,19 @@ def _causal_attention_mask(hidden, position_ids, past_len):
 
 
 def _validate_edge_layers(edge_layers):
-    if not 0 <= edge_layers <= len(layers):
-        raise ValueError(f"edge_layers must be between 0 and {len(layers)}")
+    if edge_layers != EDGE_LAYERS:
+        raise ValueError(
+            f"this cloud instance is only configured for edge_layers={EDGE_LAYERS}, "
+            f"got {edge_layers}"
+        )
 
 
-def cloud_forward(hidden, position_ids, cache, edge_layers, past_len):
+def cloud_forward(hidden, position_ids, cache, past_len):
     position_embeddings = model.model.rotary_emb(hidden, position_ids)
     attention_mask = _causal_attention_mask(hidden, position_ids, past_len)
-    for layer in layers[edge_layers:]:
+    # `layers` already only holds this device's own range ([EDGE_LAYERS:] of
+    # the full model) after partial loading, so no further slicing here.
+    for layer in layers:
         hidden = _layer_hidden(layer(
             hidden,
             attention_mask=attention_mask,
@@ -132,7 +145,9 @@ def cloud_forward(hidden, position_ids, cache, edge_layers, past_len):
 
 
 def _decode_tensors(dtype, seq_len, hidden_dim, position_ids_array, scales, payload):
-    hidden = codec.decode_activation(payload, scales, dtype, seq_len, hidden_dim, DEVICE)
+    hidden = codec.decode_activation(
+        payload, scales, dtype, seq_len, hidden_dim, DEVICE, model_dtype=TORCH_DTYPE
+    )
     positions = torch.tensor(position_ids_array, dtype=torch.long, device=DEVICE).reshape(1, -1)
     return hidden, positions
 
@@ -155,6 +170,7 @@ async def session(websocket: WebSocket):
                 _validate_edge_layers(edge_layers)
                 cache = DynamicCache()
                 past_len = 0
+                await websocket.send_bytes(codec.pack_ok())
                 continue
 
             if msg_type == codec.MSG_DECODE:
@@ -165,7 +181,7 @@ async def session(websocket: WebSocket):
                     dtype, seq_len, hidden_dim, position_ids, scales, payload
                 )
                 with torch.no_grad():
-                    logits = cloud_forward(hidden, position_ids_t, cache, edge_layers, past_len)
+                    logits = cloud_forward(hidden, position_ids_t, cache, past_len)
                     next_token = logits[:, -1, :].argmax(-1).item()
                 past_len += hidden.shape[1]
                 await websocket.send_bytes(codec.pack_decode_reply(next_token))
@@ -193,9 +209,7 @@ async def session(websocket: WebSocket):
                     raise ValueError("Hidden-state length does not match context plus drafts")
 
                 with torch.no_grad():
-                    logits = cloud_forward(
-                        hidden, position_ids_t, DynamicCache(), fields["edge_layers"], 0
-                    )
+                    logits = cloud_forward(hidden, position_ids_t, DynamicCache(), 0)
                     predicted = logits[0].argmax(-1)
 
                 accepted_count = 0
@@ -223,7 +237,8 @@ async def ping():
         "status": "alive",
         "model": MODEL_NAME,
         "device": DEVICE,
-        "num_layers": len(layers),
+        "total_layers": TOTAL_LAYERS,
+        "cloud_layers": f"{EDGE_LAYERS}:{TOTAL_LAYERS}",
     }
 
 

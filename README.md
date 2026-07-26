@@ -48,12 +48,20 @@ replaced it with raw binary encoding of the activation tensor. further optimised
 - int4: per-row scale computed as max(|row|) / 7, each value stored as a 4-bit signed integer (round(value / scale)), two values packed per byte. scale is sent alongside so the cloud side can dequantize (value ≈ int_value * scale).
 
 <u>benchmark: 5-token boundary tensor, Qwen2.5-0.5B</u>
+
 | Encoding | Bytes | vs. old JSON |
 |---|---|---|
 | Old: JSON float list | 92,613 | 1× |
 | New: binary, fp32 | 17,950 | 5.2× smaller |
 | New: binary, fp16 | 8,990 | 10.3× smaller |
 | New: binary, int4 | 2,290 | **40.4× smaller** |
+
+### device-specific model residency
+each device only holds the portion of model that it is supposed to compute. for example, if K=4, edge device only holds 0 to K-1 layers, while the cloud device will hold K to N-1 layers.
+
+this reduces resident device memory, as the unneeded layers are discarded from memory on each device.
+
+however, `load_partial_model()` loads the full model in entirety on each device into CPU, discards the unnecessary layers before moving it to MPS/CUDA. this reduces final device memory but not peak CPU loading memory.
 
 ### speculative decoding 
 - use draft model, compute first K layers on edge device. draft up to N tokens each time, and send over to cloud device to verify.
