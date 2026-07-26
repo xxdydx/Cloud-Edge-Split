@@ -122,6 +122,49 @@ The benchmark field `kv_migration_bandwidth_bytes_per_second` should not be inte
 
 The same run showed a decode regression: mean ITL increased from roughly 455 ms to 743.6 ms, with individual steps reaching 932 ms and 2425 ms. Telemetry during the spikes showed process RSS approaching 5.75 GB and system memory usage reaching 84.7%, so memory pressure is a plausible contributor.
 
+### Second Dual-K Experiment: Overlapped KV Transfer
+
+The synchronous migration in the first experiment fully exposed CPU copy, serialisation, and tunnel transfer time inside TTFT — nothing overlapped with subsequent layer compute. The natural next step was to test whether overlapping the KV send with ongoing cloud computation (via pinned buffers and a bounded in-flight queue) would recover a meaningful fraction of that exposed time.
+
+#### Queue depth = 1 (config not yet effective)
+
+The first several overlap runs were executed with `kv_transfer_queue_depth=1` still in effect at the transport layer — confirmed directly, since `kv_max_queue_depth` reported `min=1, max=1` in every run despite `overlap_kv_transfer=true`. This gave a controlled comparison: overlap machinery enabled, but with no spare buffer slots for it to use.
+
+| Run | Chunk 0 `first_kv_arrival` | Chunk 0 compute (`cloud_prefill_ms` + `kv_extraction_ms`) |
+|---|---:|---:|
+| 1 | 1826 ms | ~163 ms |
+| 2 | 1673 ms | ~89 ms |
+| 3 | 1548 ms | ~90 ms |
+| 4 | 1560 ms | ~91 ms |
+| 5 | 1676 ms | ~90 ms |
+| 6 | 1586 ms | ~87 ms |
+
+Across six repeated runs, `first_kv_arrival` stayed within a tight 1548–1826 ms band, indistinguishable from the synchronous baseline (1555 ms). TTFT likewise showed no consistent improvement (3142–3623 ms overlap runs vs. 3070 ms synchronous baseline). The overlap flag being enabled had no measurable effect while the buffer pool was limited to one slot.
+
+#### Queue depth = 4
+
+Raising `kv_transfer_queue_depth` to 4 and confirming the change took effect (`kv_max_queue_depth` now varied `min=1, max=4` across chunks) isolated whether the bottleneck was local buffer contention.
+
+| Metric | Depth = 1 | Depth = 4 |
+|---|---:|---:|
+| Chunk 0 `first_kv_arrival` | 1524–1826 ms | 1466 ms |
+| `kv_transfer_drain_ms` | 0.0 ms | 4.86 ms |
+| TTFT | 3070–3623 ms | 3259.8 ms |
+
+Increasing queue depth produced a small, real effect — `kv_transfer_drain_ms` moved off zero for the first time, indicating some local queuing wait was genuinely eliminated. But `first_kv_arrival` remained within the same band as every depth = 1 run, and TTFT showed no consistent improvement. The local buffering fix recovered on the order of single-digit milliseconds against a ~1.4-second gap — confirming that local buffer contention was never the dominant cost.
+
+#### Byte-scaling analysis
+
+Comparing the two prefill chunks within a single run isolates whether the migration cost scales with payload size or is dominated by a fixed per-message cost:
+
+| Chunk | Tokens | KV bytes | `kv_frames_sent` | `first_kv_arrival` |
+|---|---:|---:|---:|---:|
+| 0 | 64 | 1,048,792 | 8 | ~1466–1826 ms |
+| 1 | 32 | 524,504 | 8 | ~757–1170 ms |
+
+Frame count is identical (one message per migrated layer, 8 layers) across both chunks, but arrival time scales roughly with payload size. 
+
+
 
 ### Speculative Decoding
 - Use a draft model to compute the first K layers on the edge device. Draft up to N tokens at a time and send them to the cloud for verification.
