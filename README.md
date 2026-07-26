@@ -122,6 +122,15 @@ The benchmark field `kv_migration_bandwidth_bytes_per_second` should not be inte
 
 The same run showed a decode regression: mean ITL increased from roughly 455 ms to 743.6 ms, with individual steps reaching 932 ms and 2425 ms. Telemetry during the spikes showed process RSS approaching 5.75 GB and system memory usage reaching 84.7%, so memory pressure is a plausible contributor.
 
+Potential sources of the observed memory-pressure pattern include:
+
+- **macOS compressed memory and swap:** macOS compresses cold pages under pressure, which can reduce reported RSS while consuming CPU and adding latency. Keeping the process working set smaller is the main application-level mitigation.
+- **PyTorch CPU allocator behavior:** freed tensor blocks may be cached and later returned to the OS in batches, producing an allocation-and-release sawtooth that is not aligned with request boundaries.
+- **Python garbage collection:** short-lived Python objects can accumulate until a generational GC threshold is reached, causing a periodic collection pause and batch release.
+- **Dynamic KV-cache growth:** append operations based on `torch.cat` temporarily retain both the old and enlarged buffers, creating repeated allocation spikes before the old storage is reclaimed.
+- **WebSocket buffering:** networking libraries may grow and shrink internal buffers with message traffic, although this is unlikely to explain gigabyte-scale RSS changes by itself.
+- **Unrelated system pressure:** other applications on the shared machine can trigger global reclaim; process RSS and whole-system memory usage should therefore be evaluated separately.
+
 ### Second Dual-K Experiment: Overlapped KV Transfer
 
 The synchronous migration in the first experiment fully exposed CPU copy, serialisation, and tunnel transfer time inside TTFT — nothing overlapped with subsequent layer compute. The natural next step was to test whether overlapping the KV send with ongoing cloud computation (via pinned buffers and a bounded in-flight queue) would recover a meaningful fraction of that exposed time.
@@ -151,7 +160,7 @@ Raising `kv_transfer_queue_depth` to 4 and confirming the change took effect (`k
 | `kv_transfer_drain_ms` | 0.0 ms | 4.86 ms |
 | TTFT | 3070–3623 ms | 3259.8 ms |
 
-Increasing queue depth produced a small, real effect — `kv_transfer_drain_ms` moved off zero for the first time, indicating some local queuing wait was genuinely eliminated. But `first_kv_arrival` remained within the same band as every depth = 1 run, and TTFT showed no consistent improvement. The local buffering fix recovered on the order of single-digit milliseconds against a ~1.4-second gap — confirming that local buffer contention was never the dominant cost.
+Increasing queue depth produced a small, real effect — `kv_transfer_drain_ms` moved off zero for the first time, indicating some local queuing wait was genuinely eliminated. But `first_kv_arrival` remained within the same band as every depth = 1 run, and TTFT showed no consistent improvement.
 
 #### Byte-scaling analysis
 
