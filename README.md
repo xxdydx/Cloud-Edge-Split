@@ -10,10 +10,14 @@ Edge inference settings live in `config.py`. In particular:
   `False` to use the original token-by-token path.
 - Set `edge_layers` to the number of transformer layers executed on the edge.
 - Set `num_draft_tokens` to the maximum speculative block size.
+- Set `warmup_on_start` to `True` to warm the edge and cloud kernels before
+  accepting the first prompt.
 
-Restart the edge client after changing the configuration. Start the cloud
-server with `AUTH_TOKEN=<your-ngrok-token> python CLOUD.py`; its `/verify`
-endpoint is used automatically when speculative decoding is enabled.
+Start the cloud server with `AUTH_TOKEN=<your-ngrok-token> python CLOUD.py`,
+then run `python edge_client.py`. The edge model is loaded once and the process
+waits for prompts until `/quit`, `/exit`, EOF, or Ctrl-C. Each prompt receives
+fresh edge and cloud KV caches while the model weights and WebSocket connection
+remain resident.
 
 ## current implementation
 
@@ -72,7 +76,6 @@ however, `load_partial_model()` loads the full model in entirety on each device 
 **improvements**
 - for it to see tangible improvement, edge layers shd be reduced to less than 12, but not practical as the final LM head was not trained to decode intermediate representations reliably.
 - a meaningful improvement wld require training a separate auxillary early-exit head, or using a cheaper draft model and verify using larger model on cloud.
-
 
 
 

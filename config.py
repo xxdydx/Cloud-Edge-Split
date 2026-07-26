@@ -18,6 +18,7 @@ class InferenceConfig:
     torch_dtype: torch.dtype = torch.float16
     activation_dtype: str = "fp16"  # "fp32", "fp16", or "int4"
     device: str = "mps" if torch.backends.mps.is_available() else "cpu"
+    warmup_on_start: bool = True
 
     @property
     def cloud_ws_url(self):
