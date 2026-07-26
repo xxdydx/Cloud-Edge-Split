@@ -32,12 +32,17 @@ class FakeDynamicCache:
 
 class ProtocolTests(unittest.TestCase):
     def test_session_round_trip(self):
-        frame = codec.pack_session_start(4, 12, 10, True, 64, True, "fp16", True)
+        frame = codec.pack_session_start(
+            4, 12, 10, True, 64, True, "fp16", True,
+            model_name="example/model", torch_dtype="torch.float16",
+        )
         fields = codec.unpack_session_start(frame)
         self.assertEqual(fields["prefill_edge_layers"], 4)
         self.assertEqual(fields["decode_edge_layers"], 12)
         self.assertEqual(fields["prefill_chunk_size"], 64)
         self.assertTrue(fields["benchmark_enabled"])
+        self.assertEqual(fields["model_name"], "example/model")
+        self.assertEqual(fields["torch_dtype"], "torch.float16")
 
     def test_prefill_chunk_round_trip(self):
         hidden = torch.randn(1, 7, 16)

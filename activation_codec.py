@@ -36,7 +36,6 @@ _HEADER_FMT = "<BBII"        # msg_type, dtype, seq_len, hidden_dim
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _VERIFY_EXTRA_FMT = "<IHH"   # context_length, num_draft, edge_layers
 _VERIFY_EXTRA_SIZE = struct.calcsize(_VERIFY_EXTRA_FMT)
-_SESSION_START_FMT = "<BHHI?I?B?"  # both splits, limit, chunking, KV settings
 _PREFILL_EXTRA_FMT = "<I?"  # token offset, final chunk
 _KV_HEADER_FMT = "<BHII4I"  # type, layer, offset, count, B/H/S/D
 _CHUNK_COMPLETE_FMT = "<BII"  # type, offset, count
@@ -156,39 +155,43 @@ def pack_session_start(
     prefill_edge_layers, decode_edge_layers, max_new_tokens,
     chunked_prefill=True, prefill_chunk_size=64, stream_kv_layers=True,
     kv_transfer_dtype="fp16", benchmark_enabled=False,
+    model_name=None, torch_dtype=None,
 ):
-    return struct.pack(
-        _SESSION_START_FMT,
-        MSG_SESSION_START,
-        prefill_edge_layers,
-        decode_edge_layers,
-        max_new_tokens,
-        chunked_prefill,
-        prefill_chunk_size,
-        stream_kv_layers,
-        dtype_code(kv_transfer_dtype),
-        int(benchmark_enabled),
-    )
+    fields = {
+        "prefill_edge_layers": prefill_edge_layers,
+        "decode_edge_layers": decode_edge_layers,
+        "max_new_tokens": max_new_tokens,
+        "chunked_prefill": bool(chunked_prefill),
+        "prefill_chunk_size": prefill_chunk_size,
+        "stream_kv_layers": bool(stream_kv_layers),
+        "kv_transfer_dtype": kv_transfer_dtype,
+        "benchmark_enabled": bool(benchmark_enabled),
+        "model_name": model_name,
+        "torch_dtype": torch_dtype,
+    }
+    return bytes([MSG_SESSION_START]) + json.dumps(
+        fields, separators=(",", ":")
+    ).encode()
 
 
 def unpack_session_start(data):
-    (
-        _, prefill_layers, decode_layers, max_new_tokens, chunked,
-        chunk_size, stream_layers, kv_dtype, benchmark_enabled,
-    ) = struct.unpack(
-        _SESSION_START_FMT,
-        data,
-    )
-    return {
-        "prefill_edge_layers": prefill_layers,
-        "decode_edge_layers": decode_layers,
-        "max_new_tokens": max_new_tokens,
-        "chunked_prefill": chunked,
-        "prefill_chunk_size": chunk_size,
-        "stream_kv_layers": stream_layers,
-        "kv_transfer_dtype": dtype_name(kv_dtype),
-        "benchmark_enabled": bool(benchmark_enabled),
+    if message_type(data) != MSG_SESSION_START:
+        raise ValueError("not a session-start frame")
+    try:
+        fields = json.loads(data[1:])
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError("invalid session-start metadata") from error
+    required = {
+        "prefill_edge_layers", "decode_edge_layers", "max_new_tokens",
+        "chunked_prefill", "prefill_chunk_size", "stream_kv_layers",
+        "kv_transfer_dtype", "benchmark_enabled",
     }
+    missing = required.difference(fields)
+    if missing:
+        raise ValueError(
+            f"session-start metadata is missing: {sorted(missing)}"
+        )
+    return fields
 
 
 def pack_ok(metrics=None):

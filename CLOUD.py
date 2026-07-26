@@ -1,6 +1,7 @@
 """Cloud-side server for split and speculative LLM inference."""
 
 import importlib.util
+import gc
 import inspect
 import os
 import subprocess
@@ -43,7 +44,6 @@ import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pyngrok import ngrok
-from transformers import AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 import activation_codec as codec
@@ -52,35 +52,24 @@ from model_loading import load_partial_model, num_hidden_layers
 from cache_migration import assert_cache_lengths, extract_kv_delta
 
 
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 DEVICE = os.getenv("DEVICE", "cuda")
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
-TORCH_DTYPE = _DTYPES[os.getenv("TORCH_DTYPE", "float16")]
-# This cloud instance loads from its configured prefill split onward and can
-# only serve sessions with the same prefill/decode split pair.
-PREFILL_EDGE_LAYERS = int(os.getenv("PREFILL_EDGE_LAYERS", "4"))
-DECODE_EDGE_LAYERS = int(os.getenv("DECODE_EDGE_LAYERS", "12"))
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-model_load_started = time.perf_counter()
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-TOTAL_LAYERS = num_hidden_layers(MODEL_NAME)
-if not 0 < PREFILL_EDGE_LAYERS <= DECODE_EDGE_LAYERS < TOTAL_LAYERS:
-    raise ValueError(
-        "cloud layer splits must satisfy 0 < prefill <= decode < total"
-    )
-# Only this device's own layer range + lm_head; no embed_tokens is needed
-# since the cloud never receives raw token ids, only hidden states.
-model = load_partial_model(
-    MODEL_NAME, TORCH_DTYPE, DEVICE,
-    PREFILL_EDGE_LAYERS, TOTAL_LAYERS, need_embed=False, need_lm_head=True,
-)
-MODEL_LOAD_SECONDS = time.perf_counter() - model_load_started
-layers = model.model.layers
+# Model identity, dtype, and layer residency are selected by the edge's
+# session-start frame. Deployment-only settings such as DEVICE remain local.
+model = None
+layers = None
+MODEL_NAME = None
+TORCH_DTYPE = None
+TOTAL_LAYERS = None
+PREFILL_EDGE_LAYERS = None
+MODEL_LOAD_SECONDS = None
+MODEL_SESSION_LOCK = threading.Lock()
 
 app = FastAPI()
 
@@ -130,16 +119,58 @@ def _causal_attention_mask(hidden, position_ids, past_len):
     return mask.masked_fill(blocked.unsqueeze(1), torch.finfo(hidden.dtype).min)
 
 
-def _validate_splits(prefill_layers, decode_layers):
-    if (
-        prefill_layers != PREFILL_EDGE_LAYERS
-        or decode_layers != DECODE_EDGE_LAYERS
-    ):
+def _wire_torch_dtype(name):
+    normalized = str(name).removeprefix("torch.")
+    if normalized not in _DTYPES:
+        raise ValueError(f"unsupported cloud compute dtype: {name}")
+    return _DTYPES[normalized]
+
+
+def _ensure_model(model_name, torch_dtype_name, prefill_layers, decode_layers):
+    """Load the cloud range requested by the edge, reusing it when possible."""
+    global model, layers, MODEL_NAME, TORCH_DTYPE, TOTAL_LAYERS
+    global PREFILL_EDGE_LAYERS, MODEL_LOAD_SECONDS
+
+    if not model_name:
+        raise ValueError("edge session did not provide model_name")
+    requested_dtype = _wire_torch_dtype(torch_dtype_name)
+    residency_matches = (
+        model is not None
+        and MODEL_NAME == model_name
+        and TORCH_DTYPE == requested_dtype
+        and PREFILL_EDGE_LAYERS == prefill_layers
+    )
+    if residency_matches:
+        if not prefill_layers <= decode_layers < TOTAL_LAYERS:
+            raise ValueError(
+                "layer splits must satisfy prefill <= decode < total"
+            )
+        return False
+
+    total_layers = num_hidden_layers(model_name)
+    if not 0 < prefill_layers <= decode_layers < total_layers:
         raise ValueError(
-            "cloud is configured for "
-            f"prefill/decode={PREFILL_EDGE_LAYERS}/{DECODE_EDGE_LAYERS}, "
-            f"got {prefill_layers}/{decode_layers}"
+            "layer splits must satisfy 0 < prefill <= decode < total"
         )
+
+    model = None
+    layers = None
+    gc.collect()
+    if DEVICE.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    load_started = time.perf_counter()
+    model = load_partial_model(
+        model_name, requested_dtype, DEVICE,
+        prefill_layers, total_layers, need_embed=False, need_lm_head=True,
+    )
+    layers = model.model.layers
+    MODEL_NAME = model_name
+    TORCH_DTYPE = requested_dtype
+    TOTAL_LAYERS = total_layers
+    PREFILL_EDGE_LAYERS = prefill_layers
+    MODEL_LOAD_SECONDS = time.perf_counter() - load_started
+    return True
 
 
 def cloud_forward(hidden, position_ids, cache, past_len, start_layer=None):
@@ -180,6 +211,7 @@ async def session(websocket: WebSocket):
     max_new_tokens = None
     past_len = 0
     telemetry = None
+    owns_model_lock = False
 
     try:
         while True:
@@ -192,7 +224,12 @@ async def session(websocket: WebSocket):
                 decode_layers = fields["decode_edge_layers"]
                 max_new_tokens = fields["max_new_tokens"]
                 benchmark_enabled = fields["benchmark_enabled"]
-                _validate_splits(prefill_layers, decode_layers)
+                if not owns_model_lock:
+                    owns_model_lock = MODEL_SESSION_LOCK.acquire(blocking=False)
+                    if not owns_model_lock:
+                        raise RuntimeError(
+                            "cloud model is busy with another active session"
+                        )
                 if max_new_tokens < 1:
                     raise ValueError("max_new_tokens must be at least 1")
                 if fields["prefill_chunk_size"] < 1:
@@ -201,6 +238,12 @@ async def session(websocket: WebSocket):
                     raise ValueError("only fp16 KV transfer is supported")
                 if prefill_layers != decode_layers and not fields["stream_kv_layers"]:
                     raise ValueError("varied split requires streamed KV layers")
+                model_reloaded = _ensure_model(
+                    fields.get("model_name"),
+                    fields.get("torch_dtype"),
+                    prefill_layers,
+                    decode_layers,
+                )
                 cache = DynamicCache()
                 # Used by migration helpers with legacy compact-list caches.
                 cache._split_cache_base = PREFILL_EDGE_LAYERS
@@ -221,6 +264,7 @@ async def session(websocket: WebSocket):
                     "cloud_compute_dtype": str(TORCH_DTYPE),
                     "cloud_device": DEVICE,
                     "max_new_tokens": max_new_tokens,
+                    "cloud_model_reloaded": model_reloaded,
                     **fields,
                 } if benchmark_enabled else None))
                 continue
@@ -262,7 +306,7 @@ async def session(websocket: WebSocket):
                             position_embeddings=position_embeddings,
                             **_cache_argument(layer, cache),
                         ))
-                        if global_idx < DECODE_EDGE_LAYERS:
+                        if global_idx < decode_layers:
                             extraction_started = now_ns()
                             key, value = extract_kv_delta(
                                 cache, global_idx, offset, count, "fp16"
@@ -291,7 +335,7 @@ async def session(websocket: WebSocket):
                 )
                 if fields["final_chunk"]:
                     assert_cache_lengths(
-                        cache, range(DECODE_EDGE_LAYERS, TOTAL_LAYERS), past_len
+                        cache, range(decode_layers, TOTAL_LAYERS), past_len
                     )
                     next_token = logits[:, -1, :].argmax(-1).item()
                     await websocket.send_bytes(
@@ -347,9 +391,10 @@ async def session(websocket: WebSocket):
                     raise ValueError(
                         "speculative decoding is unavailable for varied split"
                     )
-                _validate_splits(
-                    fields["edge_layers"], fields["edge_layers"]
-                )
+                if fields["edge_layers"] != decode_layers:
+                    raise ValueError(
+                        "verification split does not match the active session"
+                    )
                 context_length = fields["context_length"]
                 draft_ids = fields["draft_ids"]
                 if context_length < 1 or len(draft_ids) == 0:
@@ -405,12 +450,14 @@ async def session(websocket: WebSocket):
 
     except WebSocketDisconnect:
         pass
-    except (ValueError, RuntimeError) as error:
+    except Exception as error:
         await websocket.send_bytes(bytes([codec.MSG_ERROR]) + str(error).encode())
         await websocket.close()
     finally:
         if telemetry is not None:
             telemetry.stop()
+        if owns_model_lock:
+            MODEL_SESSION_LOCK.release()
 
 
 @app.get("/ping")
@@ -421,8 +468,11 @@ async def ping():
         "device": DEVICE,
         "total_layers": TOTAL_LAYERS,
         "prefill_edge_layers": PREFILL_EDGE_LAYERS,
-        "decode_edge_layers": DECODE_EDGE_LAYERS,
-        "cloud_layers": f"{PREFILL_EDGE_LAYERS}:{TOTAL_LAYERS}",
+        "cloud_layers": (
+            f"{PREFILL_EDGE_LAYERS}:{TOTAL_LAYERS}"
+            if model is not None else None
+        ),
+        "configuration_source": "edge session handshake",
     }
 
 

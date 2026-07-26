@@ -90,8 +90,13 @@ class EdgeClient:
     def close(self):
         self.close_connection()
 
-    def _read_reply(self, unpack):
-        data = self.ws.recv(timeout=self.config.request_timeout_seconds)
+    def _read_reply(self, unpack, timeout=None):
+        data = self.ws.recv(
+            timeout=(
+                self.config.request_timeout_seconds
+                if timeout is None else timeout
+            )
+        )
         if codec.message_type(data) == codec.MSG_ERROR:
             raise RuntimeError(data[1:].decode())
         return unpack(data), len(data)
@@ -113,8 +118,13 @@ class EdgeClient:
                     stream_kv_layers=self.config.stream_kv_layers,
                     kv_transfer_dtype=self.config.kv_transfer_dtype,
                     benchmark_enabled=self._benchmark is not None,
+                    model_name=self.config.model_name,
+                    torch_dtype=str(self.config.torch_dtype),
                 ))
-                session_metrics, _ = self._read_reply(codec.unpack_ok)
+                session_metrics, _ = self._read_reply(
+                    codec.unpack_ok,
+                    timeout=self.config.model_load_timeout_seconds,
+                )
                 if self._benchmark is not None:
                     self._benchmark.session_metadata = session_metrics
                     self._benchmark.setup["session_handshake_ms"] = elapsed_ms(

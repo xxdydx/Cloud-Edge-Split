@@ -27,6 +27,7 @@ class InferenceConfig:
     num_draft_tokens: int = 3
     max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "10"))
     request_timeout_seconds: float = 60.0
+    model_load_timeout_seconds: float = 900.0
     torch_dtype: torch.dtype = torch.float16
     activation_dtype: str = "fp16"  # "fp32", "fp16", or "int4"
     # device: str = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -51,6 +52,8 @@ class InferenceConfig:
             )
         if self.prefill_chunk_size < 1:
             raise ValueError("prefill_chunk_size must be at least 1")
+        if self.model_load_timeout_seconds <= 0:
+            raise ValueError("model_load_timeout_seconds must be positive")
         if self.kv_transfer_dtype != "fp16":
             raise ValueError("only exact fp16 KV transfer is currently supported")
         if self.overlap_kv_transfer:
