@@ -164,6 +164,7 @@ async def session(websocket: WebSocket):
 
     cache = None
     edge_layers = None
+    max_new_tokens = None
     past_len = 0
     telemetry = None
 
@@ -173,8 +174,14 @@ async def session(websocket: WebSocket):
             msg_type = codec.message_type(data)
 
             if msg_type == codec.MSG_SESSION_START:
-                edge_layers, benchmark_enabled = codec.unpack_session_start(data)
+                (
+                    edge_layers,
+                    max_new_tokens,
+                    benchmark_enabled,
+                ) = codec.unpack_session_start(data)
                 _validate_edge_layers(edge_layers)
+                if max_new_tokens < 1:
+                    raise ValueError("max_new_tokens must be at least 1")
                 cache = DynamicCache()
                 past_len = 0
                 if telemetry is not None:
@@ -192,6 +199,7 @@ async def session(websocket: WebSocket):
                     "cloud_model_load_ms": MODEL_LOAD_SECONDS * 1000,
                     "cloud_compute_dtype": str(TORCH_DTYPE),
                     "cloud_device": DEVICE,
+                    "max_new_tokens": max_new_tokens,
                 } if benchmark_enabled else None))
                 continue
 

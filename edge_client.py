@@ -1,9 +1,14 @@
+import os
 import time
+
+# Powermetrics is launched as a subprocess after tokenization begins. Disable
+# tokenizers' worker pool before importing Transformers so that fork is safe.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import connect
 
 import activation_codec as codec
@@ -58,11 +63,19 @@ class EdgeClient:
         if not self.config.split_inference:
             return
         self.close_connection()
-        self.ws = connect(
-            self.config.cloud_ws_url,
-            open_timeout=self.config.request_timeout_seconds,
-            close_timeout=5,
-        )
+        try:
+            self.ws = connect(
+                self.config.cloud_ws_url,
+                open_timeout=self.config.request_timeout_seconds,
+                close_timeout=5,
+            )
+        except InvalidStatus as error:
+            raise RuntimeError(
+                f"Cloud rejected {self.config.cloud_ws_url}: {error}. "
+                "Copy the current Public URL printed by CLOUD.py and run "
+                "`CLOUD_URL=https://... python3 edge_client.py`. If /ping works "
+                "but /session returns 404, restart Kaggle with the latest CLOUD.py."
+            ) from error
 
     def close_connection(self):
         if self.ws is not None:
@@ -81,7 +94,7 @@ class EdgeClient:
             raise RuntimeError(data[1:].decode())
         return unpack(data), len(data)
 
-    def _start_session(self):
+    def _start_session(self, max_new_tokens):
         """Reset cloud KV state, reconnecting once if the socket went stale."""
         session_started = now_ns()
         reused_connection = self.ws is not None
@@ -91,6 +104,7 @@ class EdgeClient:
                     self.connect()
                 self.ws.send(codec.pack_session_start(
                     self.config.edge_layers,
+                    max_new_tokens,
                     benchmark_enabled=self._benchmark is not None,
                 ))
                 session_metrics, _ = self._read_reply(codec.unpack_ok)
@@ -433,7 +447,10 @@ class EdgeClient:
         benchmark=None,
     ):
         """Generate one response while keeping model weights resident."""
-        max_new_tokens = max_new_tokens or self.config.max_new_tokens
+        if max_new_tokens is None:
+            max_new_tokens = self.config.max_new_tokens
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
         benchmark_enabled = (
             self.config.benchmark_enabled if benchmark is None else benchmark
         )
@@ -479,7 +496,7 @@ class EdgeClient:
                 else:
                     # Every prompt gets fresh edge/cloud KV caches while model
                     # weights and the WebSocket remain resident.
-                    self._start_session()
+                    self._start_session(max_new_tokens)
                     if self.config.speculative_decoding:
                         generated, round_times, metrics = (
                             self._generate_speculative(input_ids, max_new_tokens)
@@ -570,7 +587,7 @@ class EdgeClient:
         ).input_ids.to(self.config.device)
         with torch.no_grad():
             if self.config.split_inference:
-                self._start_session()
+                self._start_session(max_new_tokens=1)
                 self._generate_standard(input_ids, max_new_tokens=1)
             else:
                 self._generate_local(input_ids, max_new_tokens=1)

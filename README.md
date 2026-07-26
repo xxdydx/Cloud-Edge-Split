@@ -10,16 +10,23 @@ Edge inference settings live in `config.py`. In particular:
   `False` to use the original token-by-token path.
 - Set `edge_layers` to the number of transformer layers executed on the edge.
 - Set `num_draft_tokens` to the maximum speculative block size.
+- Set `max_new_tokens`, or the `MAX_NEW_TOKENS` environment variable, to the
+  generation limit selected by the edge and sent to the cloud for each prompt.
 - Set `warmup_on_start` to `True` to warm the edge and cloud kernels before
   accepting the first prompt.
 - Set `benchmark_enabled` to record per-generation and per-request metrics in
   `benchmark_output` (default: `benchmarks/results.jsonl`).
 
 Start the cloud server with `AUTH_TOKEN=<your-ngrok-token> python CLOUD.py`,
-then run `python edge_client.py`. The edge model is loaded once and the process
-waits for prompts until `/quit`, `/exit`, EOF, or Ctrl-C. Each prompt receives
-fresh edge and cloud KV caches while the model weights and WebSocket connection
-remain resident.
+then copy its printed Public URL into the edge process:
+
+```bash
+CLOUD_URL=https://your-current-ngrok-url.ngrok-free.app python3 edge_client.py
+```
+
+The edge model is loaded once and the process waits for prompts until `/quit`,
+`/exit`, EOF, or Ctrl-C. Each prompt receives fresh edge and cloud KV caches
+while the model weights and WebSocket connection remain resident.
 
 ## benchmarking
 
@@ -82,6 +89,20 @@ this reduces resident device memory, as the unneeded layers are discarded from m
 
 however, `load_partial_model()` loads the full model in entirety on each device into CPU, discards the unnecessary layers before moving it to MPS/CUDA. this reduces final device memory but not peak CPU loading memory.
 
+## decode vs prefill layer split
+
+during initial experiments, there was an even split of 14 layers between cloud vs edge. these were the results.
+
+| Workload | Edge CPU (14 layers) | Cloud GPU (14 layers) | Ratio |
+|---|---:|---:|---:|
+| Single-token decode forward | 60–88 ms (mean ~68 ms) | 35.9–37.0 ms (mean ~36.8 ms) | ~1.9× cloud faster |
+| Prefill forward, per token (~88 tokens) | 28.5 ms/token | 0.91 ms/token | ~31× cloud faster |
+
+for decode, the margin between the GPU and CPU is pretty close, but it's very much different for prefill.
+
+this motivates using different split points by phase: assign fewer prefill layers to the edge and more to the cloud to exploit GPU parallelism, while choosing the decode split mainly around edge capacity, boundary-transfer cost, and per-token network latency. this also requires a re-working of the model residency logic between devices.
+
+
 ### speculative decoding 
 - use draft model, compute first K layers on edge device. draft up to N tokens each time, and send over to cloud device to verify.
 - on cloud device, verify the full pass (Initial Prompt Tokens + N newly generated tokens). from logits generated, verify if the N tokens match with the verifier model's prediction probability distributions. at the point where the verifier model disagrees with draft model, stop the chain, take the accepted tokens + bonus token and get draft model to generate N tokens again. 
@@ -91,5 +112,3 @@ however, `load_partial_model()` loads the full model in entirety on each device 
 **improvements**
 - for it to see tangible improvement, edge layers shd be reduced to less than 12, but not practical as the final LM head was not trained to decode intermediate representations reliably.
 - a meaningful improvement wld require training a separate auxillary early-exit head, or using a cheaper draft model and verify using larger model on cloud.
-
-

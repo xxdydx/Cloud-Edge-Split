@@ -32,7 +32,7 @@ _HEADER_FMT = "<BBII"        # msg_type, dtype, seq_len, hidden_dim
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _VERIFY_EXTRA_FMT = "<IHH"   # context_length, num_draft, edge_layers
 _VERIFY_EXTRA_SIZE = struct.calcsize(_VERIFY_EXTRA_FMT)
-_SESSION_START_FMT = "<BHB"  # msg_type, edge_layers, benchmark_enabled
+_SESSION_START_FMT = "<BHIB"  # msg_type, edge_layers, max_new_tokens, benchmark
 _DECODE_REPLY_FMT = "<Bi"    # msg_type, next_token
 _VERIFY_REPLY_FMT = "<BIi"   # msg_type, accepted_count, bonus_token
 _METRICS_LENGTH_FMT = "<I"
@@ -138,18 +138,22 @@ def _unpack_metrics(data, offset):
     return json.loads(payload)
 
 
-def pack_session_start(edge_layers, benchmark_enabled=False):
+def pack_session_start(edge_layers, max_new_tokens, benchmark_enabled=False):
     return struct.pack(
         _SESSION_START_FMT,
         MSG_SESSION_START,
         edge_layers,
+        max_new_tokens,
         int(benchmark_enabled),
     )
 
 
 def unpack_session_start(data):
-    _, edge_layers, benchmark_enabled = struct.unpack(_SESSION_START_FMT, data)
-    return edge_layers, bool(benchmark_enabled)
+    _, edge_layers, max_new_tokens, benchmark_enabled = struct.unpack(
+        _SESSION_START_FMT,
+        data,
+    )
+    return edge_layers, max_new_tokens, bool(benchmark_enabled)
 
 
 def pack_ok(metrics=None):
