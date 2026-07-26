@@ -23,10 +23,10 @@ class InferenceConfig:
     stream_kv_layers: bool = True
     kv_transfer_dtype: str = "fp16"
     overlap_kv_transfer: bool = True
-    kv_transfer_queue_depth: int = 1
+    kv_transfer_queue_depth: int = 4
     speculative_decoding: bool = False
     num_draft_tokens: int = 3
-    max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "10"))
+    max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "100"))
     request_timeout_seconds: float = 60.0
     model_load_timeout_seconds: float = 900.0
     torch_dtype: torch.dtype = torch.float16
