@@ -20,6 +20,10 @@ MSG_DECODE_REPLY = 4
 MSG_VERIFY_REPLY = 5
 MSG_ERROR = 6
 MSG_OK = 7
+MSG_PREFILL_CHUNK = 8
+MSG_KV_DELTA = 9
+MSG_CHUNK_COMPLETE = 10
+MSG_PREFILL_COMPLETE = 11
 
 DTYPE_FP32 = 0
 DTYPE_FP16 = 1
@@ -32,7 +36,11 @@ _HEADER_FMT = "<BBII"        # msg_type, dtype, seq_len, hidden_dim
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _VERIFY_EXTRA_FMT = "<IHH"   # context_length, num_draft, edge_layers
 _VERIFY_EXTRA_SIZE = struct.calcsize(_VERIFY_EXTRA_FMT)
-_SESSION_START_FMT = "<BHIB"  # msg_type, edge_layers, max_new_tokens, benchmark
+_SESSION_START_FMT = "<BHHI?I?B?"  # both splits, limit, chunking, KV settings
+_PREFILL_EXTRA_FMT = "<I?"  # token offset, final chunk
+_KV_HEADER_FMT = "<BHII4I"  # type, layer, offset, count, B/H/S/D
+_CHUNK_COMPLETE_FMT = "<BII"  # type, offset, count
+_PREFILL_COMPLETE_FMT = "<Bi"  # type, first generated token
 _DECODE_REPLY_FMT = "<Bi"    # msg_type, next_token
 _VERIFY_REPLY_FMT = "<BIi"   # msg_type, accepted_count, bonus_token
 _METRICS_LENGTH_FMT = "<I"
@@ -40,11 +48,17 @@ _METRICS_LENGTH_SIZE = struct.calcsize(_METRICS_LENGTH_FMT)
 
 
 def dtype_code(dtype):
-    return _DTYPE_CODES[dtype]
+    try:
+        return _DTYPE_CODES[dtype]
+    except KeyError:
+        raise ValueError(f"Unknown wire dtype: {dtype}") from None
 
 
 def dtype_name(code):
-    return _DTYPE_NAMES[code]
+    try:
+        return _DTYPE_NAMES[code]
+    except KeyError:
+        raise ValueError(f"Unknown wire dtype code: {code}") from None
 
 
 # --- quantization -----------------------------------------------------
@@ -138,22 +152,43 @@ def _unpack_metrics(data, offset):
     return json.loads(payload)
 
 
-def pack_session_start(edge_layers, max_new_tokens, benchmark_enabled=False):
+def pack_session_start(
+    prefill_edge_layers, decode_edge_layers, max_new_tokens,
+    chunked_prefill=True, prefill_chunk_size=64, stream_kv_layers=True,
+    kv_transfer_dtype="fp16", benchmark_enabled=False,
+):
     return struct.pack(
         _SESSION_START_FMT,
         MSG_SESSION_START,
-        edge_layers,
+        prefill_edge_layers,
+        decode_edge_layers,
         max_new_tokens,
+        chunked_prefill,
+        prefill_chunk_size,
+        stream_kv_layers,
+        dtype_code(kv_transfer_dtype),
         int(benchmark_enabled),
     )
 
 
 def unpack_session_start(data):
-    _, edge_layers, max_new_tokens, benchmark_enabled = struct.unpack(
+    (
+        _, prefill_layers, decode_layers, max_new_tokens, chunked,
+        chunk_size, stream_layers, kv_dtype, benchmark_enabled,
+    ) = struct.unpack(
         _SESSION_START_FMT,
         data,
     )
-    return edge_layers, max_new_tokens, bool(benchmark_enabled)
+    return {
+        "prefill_edge_layers": prefill_layers,
+        "decode_edge_layers": decode_layers,
+        "max_new_tokens": max_new_tokens,
+        "chunked_prefill": chunked,
+        "prefill_chunk_size": chunk_size,
+        "stream_kv_layers": stream_layers,
+        "kv_transfer_dtype": dtype_name(kv_dtype),
+        "benchmark_enabled": bool(benchmark_enabled),
+    }
 
 
 def pack_ok(metrics=None):
@@ -185,6 +220,80 @@ def unpack_decode(data):
         scales = b""
     payload = data[offset:]
     return dtype, seq_len, hidden_dim, position_ids, scales, payload
+
+
+def pack_prefill_chunk(hidden, position_ids, dtype, token_offset, final_chunk):
+    frame = bytearray(pack_decode(hidden, position_ids, dtype))
+    frame[0] = MSG_PREFILL_CHUNK
+    extra = struct.pack(_PREFILL_EXTRA_FMT, token_offset, final_chunk)
+    return bytes(frame[:_HEADER_SIZE] + extra + frame[_HEADER_SIZE:])
+
+
+def unpack_prefill_chunk(data):
+    extra_size = struct.calcsize(_PREFILL_EXTRA_FMT)
+    token_offset, final_chunk = struct.unpack(
+        _PREFILL_EXTRA_FMT, data[_HEADER_SIZE:_HEADER_SIZE + extra_size]
+    )
+    decode_frame = bytes([MSG_DECODE]) + data[1:_HEADER_SIZE] + data[_HEADER_SIZE + extra_size:]
+    dtype, seq_len, hidden_dim, positions, scales, payload = unpack_decode(decode_frame)
+    return {
+        "dtype": dtype, "seq_len": seq_len, "hidden_dim": hidden_dim,
+        "position_ids": positions, "scales": scales, "payload": payload,
+        "token_offset": token_offset, "final_chunk": final_chunk,
+    }
+
+
+def pack_kv_delta(layer_idx, token_offset, key, value):
+    if key.dtype != torch.float16 or value.dtype != torch.float16:
+        raise ValueError("KV wire dtype must be fp16")
+    if key.shape != value.shape or key.ndim != 4 or key.shape[0] != 1:
+        raise ValueError("invalid KV shapes")
+    shape = tuple(key.shape)
+    header = struct.pack(
+        _KV_HEADER_FMT, MSG_KV_DELTA, layer_idx, token_offset, shape[-2], *shape
+    )
+    return header + key.cpu().numpy().tobytes() + value.cpu().numpy().tobytes()
+
+
+def unpack_kv_delta(data, device="cpu"):
+    header_size = struct.calcsize(_KV_HEADER_FMT)
+    _, layer_idx, offset, count, *shape = struct.unpack(
+        _KV_HEADER_FMT, data[:header_size]
+    )
+    if shape[-2] != count or any(dimension < 1 for dimension in shape):
+        raise ValueError("invalid KV frame shape")
+    tensor_bytes = int(np.prod(shape)) * 2
+    if len(data) != header_size + 2 * tensor_bytes:
+        raise ValueError("KV payload length does not match shape")
+    key_array = np.frombuffer(data, dtype=np.float16, count=int(np.prod(shape)), offset=header_size)
+    value_array = np.frombuffer(data, dtype=np.float16, count=int(np.prod(shape)), offset=header_size + tensor_bytes)
+    key = torch.from_numpy(key_array.copy()).reshape(shape).to(device)
+    value = torch.from_numpy(value_array.copy()).reshape(shape).to(device)
+    return layer_idx, offset, key, value
+
+
+def pack_chunk_complete(token_offset, token_count, metrics=None):
+    return struct.pack(
+        _CHUNK_COMPLETE_FMT, MSG_CHUNK_COMPLETE, token_offset, token_count
+    ) + _pack_metrics(metrics)
+
+
+def unpack_chunk_complete(data):
+    size = struct.calcsize(_CHUNK_COMPLETE_FMT)
+    _, offset, count = struct.unpack(_CHUNK_COMPLETE_FMT, data[:size])
+    return offset, count, _unpack_metrics(data, size)
+
+
+def pack_prefill_complete(next_token, metrics=None):
+    return struct.pack(
+        _PREFILL_COMPLETE_FMT, MSG_PREFILL_COMPLETE, next_token
+    ) + _pack_metrics(metrics)
+
+
+def unpack_prefill_complete(data):
+    size = struct.calcsize(_PREFILL_COMPLETE_FMT)
+    _, token = struct.unpack(_PREFILL_COMPLETE_FMT, data[:size])
+    return token, _unpack_metrics(data, size)
 
 
 def pack_verify(hidden, position_ids, dtype, context_length, draft_ids, edge_layers):

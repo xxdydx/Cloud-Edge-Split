@@ -22,7 +22,8 @@ from benchmarking import (
     now_ns,
 )
 from config import CONFIG
-from model_loading import load_partial_model
+from model_loading import load_partial_model, num_hidden_layers
+from cache_migration import assert_cache_lengths, install_kv_delta
 from spec_decoding import draft_and_prepare_verification, run_edge_layers
 
 
@@ -39,6 +40,7 @@ class EdgeClient:
         load_started = time.perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         if config.split_inference:
+            config.validate(num_hidden_layers(config.model_name))
             # Speculative drafting needs the LM head; standard split inference
             # only needs embeddings and the edge layer range.
             self.model = load_partial_model(
@@ -46,7 +48,7 @@ class EdgeClient:
                 config.torch_dtype,
                 config.device,
                 0,
-                config.edge_layers,
+                config.decode_edge_layers,
                 need_embed=True,
                 need_lm_head=config.speculative_decoding,
             )
@@ -103,8 +105,13 @@ class EdgeClient:
                 if self.ws is None:
                     self.connect()
                 self.ws.send(codec.pack_session_start(
-                    self.config.edge_layers,
+                    self.config.prefill_edge_layers,
+                    self.config.decode_edge_layers,
                     max_new_tokens,
+                    chunked_prefill=self.config.chunked_prefill,
+                    prefill_chunk_size=self.config.prefill_chunk_size,
+                    stream_kv_layers=self.config.stream_kv_layers,
+                    kv_transfer_dtype=self.config.kv_transfer_dtype,
                     benchmark_enabled=self._benchmark is not None,
                 ))
                 session_metrics, _ = self._read_reply(codec.unpack_ok)
@@ -239,6 +246,184 @@ class EdgeClient:
             if next_token == self.tokenizer.eos_token_id:
                 break
 
+        return generated, round_times
+
+    def _generate_varied_split(self, input_ids, max_new_tokens):
+        """Chunked prompt prefill with synchronous per-layer KV migration."""
+        edge_cache = DynamicCache()
+        prompt_len = input_ids.shape[1]
+        chunk_size = (
+            self.config.prefill_chunk_size
+            if self.config.chunked_prefill else prompt_len
+        )
+        generated = []
+        round_times = []
+        next_token = None
+        prefill_started = now_ns()
+
+        for offset in range(0, prompt_len, chunk_size):
+            request_started = now_ns()
+            chunk = input_ids[:, offset:offset + chunk_size]
+            hidden, position_ids = run_edge_layers(
+                self.model,
+                chunk,
+                edge_cache,
+                self.config.prefill_edge_layers,
+                offset,
+            )
+            frame = codec.pack_prefill_chunk(
+                hidden,
+                position_ids,
+                self.config.activation_dtype,
+                offset,
+                offset + chunk.shape[1] == prompt_len,
+            )
+            self.ws.send(frame)
+            reply_bytes = 0
+            kv_bytes = 0
+            kv_install_ms = 0.0
+            first_kv_ns = None
+            final_kv_ns = None
+            expected_layer = self.config.prefill_edge_layers
+            chunk_metrics = {}
+            while True:
+                data = self.ws.recv(timeout=self.config.request_timeout_seconds)
+                reply_bytes += len(data)
+                msg_type = codec.message_type(data)
+                if msg_type == codec.MSG_ERROR:
+                    raise RuntimeError(data[1:].decode())
+                if msg_type == codec.MSG_KV_DELTA:
+                    arrival_ns = now_ns()
+                    if first_kv_ns is None:
+                        first_kv_ns = arrival_ns
+                    final_kv_ns = arrival_ns
+                    layer_idx, token_offset, key, value = codec.unpack_kv_delta(
+                        data, self.config.device
+                    )
+                    if layer_idx != expected_layer:
+                        raise ValueError(
+                            f"out-of-order KV layer: expected {expected_layer}, "
+                            f"got {layer_idx}"
+                        )
+                    if token_offset != offset or key.shape[-2] != chunk.shape[1]:
+                        raise ValueError("KV delta does not match prefill chunk")
+                    install_started = now_ns()
+                    install_kv_delta(
+                        edge_cache, layer_idx, token_offset, key, value
+                    )
+                    kv_install_ms += elapsed_ms(install_started)
+                    expected_layer += 1
+                    kv_bytes += len(data)
+                    continue
+                if msg_type == codec.MSG_CHUNK_COMPLETE:
+                    completed_offset, completed_count, chunk_metrics = (
+                        codec.unpack_chunk_complete(data)
+                    )
+                    if (completed_offset, completed_count) != (
+                        offset, chunk.shape[1]
+                    ):
+                        raise ValueError("chunk completion metadata mismatch")
+                    if expected_layer != self.config.decode_edge_layers:
+                        raise ValueError("chunk completed before all KV layers arrived")
+                    break
+                raise ValueError(f"unexpected prefill response type {msg_type}")
+
+            if self._benchmark:
+                encoded = encoded_activation_bytes(
+                    hidden, self.config.activation_dtype
+                )
+                self._benchmark.add_request({
+                    "index": len(self._benchmark.requests),
+                    "type": "prefill_chunk",
+                    "input_sequence_length": chunk.shape[1],
+                    "output_tokens": 0,
+                    "timings_ms": {
+                        "round_total": elapsed_ms(request_started),
+                        "kv_install": kv_install_ms,
+                        "first_kv_arrival": (
+                            elapsed_ms(request_started, first_kv_ns)
+                            if first_kv_ns else None
+                        ),
+                        "final_kv_arrival": (
+                            elapsed_ms(request_started, final_kv_ns)
+                            if final_kv_ns else None
+                        ),
+                    },
+                    "bytes": {
+                        "raw_activation": hidden.numel() * hidden.element_size(),
+                        "encoded_activation": encoded,
+                        "quantization_scales": (
+                            hidden.shape[1] * 4
+                            if self.config.activation_dtype == "int4" else 0
+                        ),
+                        "metadata": len(frame) - encoded,
+                        "frame_out": len(frame),
+                        "frame_in": reply_bytes,
+                        "kv_migration": kv_bytes,
+                    },
+                    "edge_telemetry": {},
+                    "cloud": chunk_metrics,
+                })
+
+        assert_cache_lengths(
+            edge_cache, range(self.config.decode_edge_layers), prompt_len
+        )
+        data = self.ws.recv(timeout=self.config.request_timeout_seconds)
+        if codec.message_type(data) == codec.MSG_ERROR:
+            raise RuntimeError(data[1:].decode())
+        if codec.message_type(data) != codec.MSG_PREFILL_COMPLETE:
+            raise ValueError("expected final prefill completion")
+        next_token, cloud_metrics = codec.unpack_prefill_complete(data)
+        prefill_ms = elapsed_ms(prefill_started)
+        if self._benchmark and self._benchmark.requests:
+            self._benchmark.requests[-1]["bytes"]["frame_in"] += len(data)
+            total_kv = sum(
+                request["bytes"].get("kv_migration", 0)
+                for request in self._benchmark.requests
+            )
+            self._benchmark.setup.update({
+                "prefill_total_ms": prefill_ms,
+                "kv_migration_bytes": total_kv,
+                "kv_migration_bandwidth_bytes_per_second": (
+                    total_kv / (prefill_ms / 1000) if prefill_ms else None
+                ),
+            })
+        generated.append(next_token)
+        if self._benchmark:
+            self._benchmark.mark_tokens(1)
+
+        cur_token = torch.tensor([[next_token]], device=input_ids.device)
+        past_len = prompt_len
+        while len(generated) < max_new_tokens and next_token != self.tokenizer.eos_token_id:
+            started = time.perf_counter()
+            request_started = now_ns()
+            hidden, position_ids = run_edge_layers(
+                self.model,
+                cur_token,
+                edge_cache,
+                self.config.decode_edge_layers,
+                past_len,
+            )
+            frame = codec.pack_decode(
+                hidden, position_ids, self.config.activation_dtype
+            )
+            self.ws.send(frame)
+            (next_token, cloud_metrics), reply_bytes = self._read_reply(
+                codec.unpack_decode_reply
+            )
+            generated.append(next_token)
+            round_times.append(time.perf_counter() - started)
+            past_len += 1
+            cur_token = torch.tensor([[next_token]], device=input_ids.device)
+            if self._benchmark:
+                self._benchmark.mark_tokens(1)
+            self._record_request(
+                "decode", hidden, frame, reply_bytes, 1,
+                {"round_total": elapsed_ms(request_started)},
+                cloud_metrics, request_started, now_ns(),
+            )
+
+        round_times.insert(0, prefill_ms / 1000)
         return generated, round_times
 
     def _generate_speculative(self, input_ids, max_new_tokens):
@@ -497,7 +682,16 @@ class EdgeClient:
                     # Every prompt gets fresh edge/cloud KV caches while model
                     # weights and the WebSocket remain resident.
                     self._start_session(max_new_tokens)
-                    if self.config.speculative_decoding:
+                    if (
+                        self.config.prefill_edge_layers
+                        != self.config.decode_edge_layers
+                    ):
+                        generated, round_times = self._generate_varied_split(
+                            input_ids, max_new_tokens
+                        )
+                        mode = "phase_split"
+                        metrics = None
+                    elif self.config.speculative_decoding:
                         generated, round_times, metrics = (
                             self._generate_speculative(input_ids, max_new_tokens)
                         )
@@ -523,6 +717,10 @@ class EdgeClient:
             )
             raise RuntimeError(message) from None
         except Exception as error:
+            if self.config.split_inference:
+                # Protocol/cache validation failures also make the peer's
+                # in-progress session unusable. Never reuse that socket.
+                self.close_connection()
             self._finish_benchmark(
                 len(generated),
                 status="failed",
@@ -588,7 +786,13 @@ class EdgeClient:
         with torch.no_grad():
             if self.config.split_inference:
                 self._start_session(max_new_tokens=1)
-                self._generate_standard(input_ids, max_new_tokens=1)
+                if (
+                    self.config.prefill_edge_layers
+                    != self.config.decode_edge_layers
+                ):
+                    self._generate_varied_split(input_ids, max_new_tokens=1)
+                else:
+                    self._generate_standard(input_ids, max_new_tokens=1)
             else:
                 self._generate_local(input_ids, max_new_tokens=1)
 

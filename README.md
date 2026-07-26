@@ -8,7 +8,12 @@ Edge inference settings live in `config.py`. In particular:
 
 - Set `speculative_decoding` to `True` to use batched draft verification, or
   `False` to use the original token-by-token path.
-- Set `edge_layers` to the number of transformer layers executed on the edge.
+- Set `prefill_edge_layers` and `decode_edge_layers` to the edge layer counts
+  for prompt processing and token decoding. They must satisfy
+  `0 < prefill_edge_layers <= decode_edge_layers < total_layers`.
+- `chunked_prefill=True` divides prompts into `prefill_chunk_size` token
+  chunks (64 by default). `kv_transfer_dtype` is currently restricted to
+  exact FP16 and transfers are synchronous.
 - Set `num_draft_tokens` to the maximum speculative block size.
 - Set `max_new_tokens`, or the `MAX_NEW_TOKENS` environment variable, to the
   generation limit selected by the edge and sent to the cloud for each prompt.
@@ -53,9 +58,6 @@ disaggregated inference — edge device will compute the forward pass of the LLM
 up to first K layers. edge device will have its own KV cache. then, the hidden
 states will be sent up to the cloud, and forward pass for remaining N-K layers
 will be computed.
-
-## to-do items
-- diff K split for prefill & decode
 
 <!-- ### cons of current implementation
 - every generated token costs one full round trip, edge device computes K layers -> network hop -> cloud computes N-K layers -> network hop back to edge device.

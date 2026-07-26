@@ -49,6 +49,7 @@ from transformers.cache_utils import DynamicCache
 import activation_codec as codec
 from benchmarking import TelemetrySampler, elapsed_ms, now_ns
 from model_loading import load_partial_model, num_hidden_layers
+from cache_migration import assert_cache_lengths, extract_kv_delta
 
 
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B")
@@ -57,9 +58,10 @@ PORT = int(os.getenv("PORT", "8000"))
 DEVICE = os.getenv("DEVICE", "cuda")
 _DTYPES = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 TORCH_DTYPE = _DTYPES[os.getenv("TORCH_DTYPE", "float16")]
-# Fixed split point this cloud instance is configured to serve — it only
-# ever loads layers[EDGE_LAYERS:], so it cannot serve any other value.
-EDGE_LAYERS = int(os.getenv("EDGE_LAYERS", "14"))
+# This cloud instance loads from its configured prefill split onward and can
+# only serve sessions with the same prefill/decode split pair.
+PREFILL_EDGE_LAYERS = int(os.getenv("PREFILL_EDGE_LAYERS", "4"))
+DECODE_EDGE_LAYERS = int(os.getenv("DECODE_EDGE_LAYERS", "12"))
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -67,11 +69,15 @@ torch.backends.cudnn.allow_tf32 = False
 model_load_started = time.perf_counter()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 TOTAL_LAYERS = num_hidden_layers(MODEL_NAME)
+if not 0 < PREFILL_EDGE_LAYERS <= DECODE_EDGE_LAYERS < TOTAL_LAYERS:
+    raise ValueError(
+        "cloud layer splits must satisfy 0 < prefill <= decode < total"
+    )
 # Only this device's own layer range + lm_head; no embed_tokens is needed
 # since the cloud never receives raw token ids, only hidden states.
 model = load_partial_model(
     MODEL_NAME, TORCH_DTYPE, DEVICE,
-    EDGE_LAYERS, TOTAL_LAYERS, need_embed=False, need_lm_head=True,
+    PREFILL_EDGE_LAYERS, TOTAL_LAYERS, need_embed=False, need_lm_head=True,
 )
 MODEL_LOAD_SECONDS = time.perf_counter() - model_load_started
 layers = model.model.layers
@@ -124,20 +130,26 @@ def _causal_attention_mask(hidden, position_ids, past_len):
     return mask.masked_fill(blocked.unsqueeze(1), torch.finfo(hidden.dtype).min)
 
 
-def _validate_edge_layers(edge_layers):
-    if edge_layers != EDGE_LAYERS:
+def _validate_splits(prefill_layers, decode_layers):
+    if (
+        prefill_layers != PREFILL_EDGE_LAYERS
+        or decode_layers != DECODE_EDGE_LAYERS
+    ):
         raise ValueError(
-            f"this cloud instance is only configured for edge_layers={EDGE_LAYERS}, "
-            f"got {edge_layers}"
+            "cloud is configured for "
+            f"prefill/decode={PREFILL_EDGE_LAYERS}/{DECODE_EDGE_LAYERS}, "
+            f"got {prefill_layers}/{decode_layers}"
         )
 
 
-def cloud_forward(hidden, position_ids, cache, past_len):
+def cloud_forward(hidden, position_ids, cache, past_len, start_layer=None):
     position_embeddings = model.model.rotary_emb(hidden, position_ids)
     attention_mask = _causal_attention_mask(hidden, position_ids, past_len)
-    # `layers` already only holds this device's own range ([EDGE_LAYERS:] of
-    # the full model) after partial loading, so no further slicing here.
-    for layer in layers:
+    start_layer = (
+        PREFILL_EDGE_LAYERS if start_layer is None else start_layer
+    )
+    local_start = start_layer - PREFILL_EDGE_LAYERS
+    for layer in layers[local_start:]:
         hidden = _layer_hidden(layer(
             hidden,
             attention_mask=attention_mask,
@@ -163,7 +175,8 @@ async def session(websocket: WebSocket):
     await websocket.accept()
 
     cache = None
-    edge_layers = None
+    prefill_layers = None
+    decode_layers = None
     max_new_tokens = None
     past_len = 0
     telemetry = None
@@ -174,15 +187,23 @@ async def session(websocket: WebSocket):
             msg_type = codec.message_type(data)
 
             if msg_type == codec.MSG_SESSION_START:
-                (
-                    edge_layers,
-                    max_new_tokens,
-                    benchmark_enabled,
-                ) = codec.unpack_session_start(data)
-                _validate_edge_layers(edge_layers)
+                fields = codec.unpack_session_start(data)
+                prefill_layers = fields["prefill_edge_layers"]
+                decode_layers = fields["decode_edge_layers"]
+                max_new_tokens = fields["max_new_tokens"]
+                benchmark_enabled = fields["benchmark_enabled"]
+                _validate_splits(prefill_layers, decode_layers)
                 if max_new_tokens < 1:
                     raise ValueError("max_new_tokens must be at least 1")
+                if fields["prefill_chunk_size"] < 1:
+                    raise ValueError("prefill chunk size must be at least 1")
+                if fields["kv_transfer_dtype"] != "fp16":
+                    raise ValueError("only fp16 KV transfer is supported")
+                if prefill_layers != decode_layers and not fields["stream_kv_layers"]:
+                    raise ValueError("varied split requires streamed KV layers")
                 cache = DynamicCache()
+                # Used by migration helpers with legacy compact-list caches.
+                cache._split_cache_base = PREFILL_EDGE_LAYERS
                 past_len = 0
                 if telemetry is not None:
                     telemetry.stop()
@@ -200,7 +221,82 @@ async def session(websocket: WebSocket):
                     "cloud_compute_dtype": str(TORCH_DTYPE),
                     "cloud_device": DEVICE,
                     "max_new_tokens": max_new_tokens,
+                    **fields,
                 } if benchmark_enabled else None))
+                continue
+
+            if msg_type == codec.MSG_PREFILL_CHUNK:
+                request_started = now_ns()
+                if cache is None:
+                    raise ValueError("Session not started")
+                fields = codec.unpack_prefill_chunk(data)
+                offset = fields["token_offset"]
+                count = fields["seq_len"]
+                if offset != past_len:
+                    raise ValueError(
+                        f"prefill offset mismatch: expected {past_len}, got {offset}"
+                    )
+                if count < 1:
+                    raise ValueError("prefill chunk cannot be empty")
+                hidden, position_ids_t = _decode_tensors(
+                    fields["dtype"], count, fields["hidden_dim"],
+                    fields["position_ids"], fields["scales"], fields["payload"],
+                )
+                position_embeddings = model.model.rotary_emb(
+                    hidden, position_ids_t
+                )
+                attention_mask = _causal_attention_mask(
+                    hidden, position_ids_t, past_len
+                )
+                kv_bytes = 0
+                extraction_ms = 0.0
+                forward_started = now_ns()
+                with torch.no_grad():
+                    for local_idx, layer in enumerate(layers):
+                        global_idx = PREFILL_EDGE_LAYERS + local_idx
+                        hidden = _layer_hidden(layer(
+                            hidden,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids_t,
+                            use_cache=True,
+                            position_embeddings=position_embeddings,
+                            **_cache_argument(layer, cache),
+                        ))
+                        if global_idx < DECODE_EDGE_LAYERS:
+                            extraction_started = now_ns()
+                            key, value = extract_kv_delta(
+                                cache, global_idx, offset, count, "fp16"
+                            )
+                            frame = codec.pack_kv_delta(
+                                global_idx, offset, key, value
+                            )
+                            extraction_ms += elapsed_ms(extraction_started)
+                            kv_bytes += len(frame)
+                            await websocket.send_bytes(frame)
+                    hidden = model.model.norm(hidden)
+                    logits = model.lm_head(hidden)
+                forward_finished = now_ns()
+                past_len += count
+                metrics = {
+                    "cloud_prefill_ms": elapsed_ms(
+                        forward_started, forward_finished
+                    ),
+                    "kv_extraction_ms": extraction_ms,
+                    "kv_bytes": kv_bytes,
+                    "chunk_total_ms": elapsed_ms(request_started),
+                    "request_bytes": len(data),
+                }
+                await websocket.send_bytes(
+                    codec.pack_chunk_complete(offset, count, metrics)
+                )
+                if fields["final_chunk"]:
+                    assert_cache_lengths(
+                        cache, range(DECODE_EDGE_LAYERS, TOTAL_LAYERS), past_len
+                    )
+                    next_token = logits[:, -1, :].argmax(-1).item()
+                    await websocket.send_bytes(
+                        codec.pack_prefill_complete(next_token, metrics)
+                    )
                 continue
 
             if msg_type == codec.MSG_DECODE:
@@ -217,7 +313,10 @@ async def session(websocket: WebSocket):
                 decode_finished = now_ns()
                 forward_started = now_ns()
                 with torch.no_grad():
-                    logits = cloud_forward(hidden, position_ids_t, cache, past_len)
+                    logits = cloud_forward(
+                        hidden, position_ids_t, cache, past_len,
+                        start_layer=decode_layers,
+                    )
                     next_token = logits[:, -1, :].argmax(-1).item()
                 forward_finished = now_ns()
                 past_len += hidden.shape[1]
@@ -244,7 +343,13 @@ async def session(websocket: WebSocket):
                     telemetry.capture()
                 decode_started = now_ns()
                 fields = codec.unpack_verify(data)
-                _validate_edge_layers(fields["edge_layers"])
+                if prefill_layers != decode_layers:
+                    raise ValueError(
+                        "speculative decoding is unavailable for varied split"
+                    )
+                _validate_splits(
+                    fields["edge_layers"], fields["edge_layers"]
+                )
                 context_length = fields["context_length"]
                 draft_ids = fields["draft_ids"]
                 if context_length < 1 or len(draft_ids) == 0:
@@ -315,7 +420,9 @@ async def ping():
         "model": MODEL_NAME,
         "device": DEVICE,
         "total_layers": TOTAL_LAYERS,
-        "cloud_layers": f"{EDGE_LAYERS}:{TOTAL_LAYERS}",
+        "prefill_edge_layers": PREFILL_EDGE_LAYERS,
+        "decode_edge_layers": DECODE_EDGE_LAYERS,
+        "cloud_layers": f"{PREFILL_EDGE_LAYERS}:{TOTAL_LAYERS}",
     }
 
 

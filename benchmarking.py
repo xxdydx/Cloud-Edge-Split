@@ -345,6 +345,9 @@ class BenchmarkRun:
         incoming = sum(item["bytes"]["frame_in"] for item in self.requests)
         raw = sum(item["bytes"]["raw_activation"] for item in self.requests)
         encoded = sum(item["bytes"]["encoded_activation"] for item in self.requests)
+        kv_migration = sum(
+            item["bytes"].get("kv_migration", 0) for item in self.requests
+        )
         total_ms = elapsed_ms(self.start_ns, end_ns)
         return {
             "schema_version": 1,
@@ -356,6 +359,12 @@ class BenchmarkRun:
                 "model": self.config.model_name,
                 "split_inference": self.config.split_inference,
                 "edge_layers": self.config.edge_layers,
+                "prefill_edge_layers": self.config.prefill_edge_layers,
+                "decode_edge_layers": self.config.decode_edge_layers,
+                "chunked_prefill": self.config.chunked_prefill,
+                "prefill_chunk_size": self.config.prefill_chunk_size,
+                "stream_kv_layers": self.config.stream_kv_layers,
+                "kv_transfer_dtype": self.config.kv_transfer_dtype,
                 "speculative_decoding": self.config.speculative_decoding,
                 "edge_compute_dtype": str(self.config.torch_dtype),
                 "activation_dtype": self.config.activation_dtype,
@@ -384,6 +393,7 @@ class BenchmarkRun:
                 "total_application_bytes": outgoing + incoming,
                 "raw_activation_bytes": raw,
                 "encoded_activation_bytes": encoded,
+                "kv_migration_bytes": kv_migration,
                 "activation_compression_ratio": raw / encoded if encoded else None,
                 "excludes_tcp_tls_websocket_overhead": True,
             },

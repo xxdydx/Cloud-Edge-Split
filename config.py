@@ -16,8 +16,14 @@ class InferenceConfig:
         "https://liquid-cycling-kindle.ngrok-free.dev",
     )
     split_inference: bool = True
-    edge_layers: int = 14  # of 28 total layers in Qwen2.5-7B
-    speculative_decoding: bool = True
+    prefill_edge_layers: int = 4
+    decode_edge_layers: int = 12
+    chunked_prefill: bool = True
+    prefill_chunk_size: int = 64
+    stream_kv_layers: bool = True
+    kv_transfer_dtype: str = "fp16"
+    overlap_kv_transfer: bool = False
+    speculative_decoding: bool = False
     num_draft_tokens: int = 3
     max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "10"))
     request_timeout_seconds: float = 60.0
@@ -31,6 +37,30 @@ class InferenceConfig:
     benchmark_output: str = "benchmarks/results.jsonl"
     telemetry_interval_ms: int = 100
     edge_power_sampler: str = "powermetrics"  
+
+    @property
+    def edge_layers(self):
+        """Compatibility alias for code paths which have a single split."""
+        return self.decode_edge_layers
+
+    def validate(self, total_layers):
+        if not 0 < self.prefill_edge_layers <= self.decode_edge_layers < total_layers:
+            raise ValueError(
+                "layer splits must satisfy 0 < prefill_edge_layers <= "
+                "decode_edge_layers < total_layers"
+            )
+        if self.prefill_chunk_size < 1:
+            raise ValueError("prefill_chunk_size must be at least 1")
+        if self.kv_transfer_dtype != "fp16":
+            raise ValueError("only exact fp16 KV transfer is currently supported")
+        if self.overlap_kv_transfer:
+            raise ValueError("asynchronous KV transfer overlap is not implemented")
+        if self.speculative_decoding and (
+            self.prefill_edge_layers != self.decode_edge_layers
+        ):
+            raise ValueError(
+                "speculative decoding requires equal prefill/decode split points"
+            )
 
     @property
     def cloud_ws_url(self):
