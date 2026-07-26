@@ -8,7 +8,8 @@ Edge inference settings live in `config.py`. In particular:
 
 - Set `speculative_decoding` to `True` to use batched draft verification, or `False` to use the original token-by-token path.
 - Set `prefill_edge_layers` and `decode_edge_layers` to the edge layer counts for prompt processing and token decoding. They must satisfy `0 < prefill_edge_layers <= decode_edge_layers < total_layers`.
-- `chunked_prefill=True` divides prompts into `prefill_chunk_size` token chunks (64 by default). `kv_transfer_dtype` is currently restricted to exact FP16 and transfers are synchronous.
+- `chunked_prefill=True` divides prompts into `prefill_chunk_size` token chunks (64 by default).
+- `overlap_kv_transfer=True` streams each migrated layer's KV frame while the cloud computes subsequent layers. `kv_transfer_queue_depth` bounds buffered frames and defaults to 1; set `overlap_kv_transfer=False` for the synchronous comparison path.
 - Set `num_draft_tokens` to the maximum speculative block size.
 - Set `max_new_tokens`, or the `MAX_NEW_TOKENS` environment variable, to the generation limit selected by the edge and sent to the cloud for each prompt.
 - Set `warmup_on_start` to `True` to warm the edge and cloud kernels before accepting the first prompt.

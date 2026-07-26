@@ -365,6 +365,10 @@ class BenchmarkRun:
                 "prefill_chunk_size": self.config.prefill_chunk_size,
                 "stream_kv_layers": self.config.stream_kv_layers,
                 "kv_transfer_dtype": self.config.kv_transfer_dtype,
+                "overlap_kv_transfer": self.config.overlap_kv_transfer,
+                "kv_transfer_queue_depth": (
+                    self.config.kv_transfer_queue_depth
+                ),
                 "speculative_decoding": self.config.speculative_decoding,
                 "edge_compute_dtype": str(self.config.torch_dtype),
                 "activation_dtype": self.config.activation_dtype,

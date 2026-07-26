@@ -155,7 +155,8 @@ def pack_session_start(
     prefill_edge_layers, decode_edge_layers, max_new_tokens,
     chunked_prefill=True, prefill_chunk_size=64, stream_kv_layers=True,
     kv_transfer_dtype="fp16", benchmark_enabled=False,
-    model_name=None, torch_dtype=None,
+    model_name=None, torch_dtype=None, overlap_kv_transfer=False,
+    kv_transfer_queue_depth=1,
 ):
     fields = {
         "prefill_edge_layers": prefill_edge_layers,
@@ -165,6 +166,8 @@ def pack_session_start(
         "prefill_chunk_size": prefill_chunk_size,
         "stream_kv_layers": bool(stream_kv_layers),
         "kv_transfer_dtype": kv_transfer_dtype,
+        "overlap_kv_transfer": bool(overlap_kv_transfer),
+        "kv_transfer_queue_depth": kv_transfer_queue_depth,
         "benchmark_enabled": bool(benchmark_enabled),
         "model_name": model_name,
         "torch_dtype": torch_dtype,
@@ -191,6 +194,9 @@ def unpack_session_start(data):
         raise ValueError(
             f"session-start metadata is missing: {sorted(missing)}"
         )
+    # Defaults retain compatibility with clients from before overlap support.
+    fields.setdefault("overlap_kv_transfer", False)
+    fields.setdefault("kv_transfer_queue_depth", 1)
     return fields
 
 

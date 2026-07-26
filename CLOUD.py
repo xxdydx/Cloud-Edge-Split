@@ -50,6 +50,7 @@ import activation_codec as codec
 from benchmarking import TelemetrySampler, elapsed_ms, now_ns
 from model_loading import load_partial_model, num_hidden_layers
 from cache_migration import assert_cache_lengths, extract_kv_delta
+from kv_streaming import stream_from_worker
 
 
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -201,6 +202,55 @@ def _decode_tensors(dtype, seq_len, hidden_dim, position_ids_array, scales, payl
     return hidden, positions
 
 
+def _produce_prefill_frames(
+    hidden,
+    position_ids,
+    attention_mask,
+    position_embeddings,
+    cache,
+    offset,
+    count,
+    decode_layers,
+    emit,
+):
+    """Compute a prefill chunk and emit serialized KV frames in layer order."""
+    kv_bytes = 0
+    extraction_ms = 0.0
+    forward_started = now_ns()
+    with torch.no_grad():
+        for local_idx, layer in enumerate(layers):
+            global_idx = PREFILL_EDGE_LAYERS + local_idx
+            hidden = _layer_hidden(layer(
+                hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=True,
+                position_embeddings=position_embeddings,
+                **_cache_argument(layer, cache),
+            ))
+            if global_idx < decode_layers:
+                extraction_started = now_ns()
+                key, value = extract_kv_delta(
+                    cache, global_idx, offset, count, "fp16"
+                )
+                frame = codec.pack_kv_delta(
+                    global_idx, offset, key, value
+                )
+                extraction_ms += elapsed_ms(extraction_started)
+                kv_bytes += len(frame)
+                emit(frame)
+        hidden = model.model.norm(hidden)
+        logits = model.lm_head(hidden)
+    forward_finished = now_ns()
+    return {
+        "logits": logits,
+        "forward_started_ns": forward_started,
+        "forward_finished_ns": forward_finished,
+        "kv_extraction_ms": extraction_ms,
+        "kv_bytes": kv_bytes,
+    }
+
+
 @app.websocket("/session")
 async def session(websocket: WebSocket):
     await websocket.accept()
@@ -212,6 +262,8 @@ async def session(websocket: WebSocket):
     past_len = 0
     telemetry = None
     owns_model_lock = False
+    overlap_kv_transfer = False
+    kv_transfer_queue_depth = 1
 
     try:
         while True:
@@ -238,6 +290,16 @@ async def session(websocket: WebSocket):
                     raise ValueError("only fp16 KV transfer is supported")
                 if prefill_layers != decode_layers and not fields["stream_kv_layers"]:
                     raise ValueError("varied split requires streamed KV layers")
+                overlap_kv_transfer = fields["overlap_kv_transfer"]
+                kv_transfer_queue_depth = fields["kv_transfer_queue_depth"]
+                if kv_transfer_queue_depth < 1:
+                    raise ValueError(
+                        "KV transfer queue depth must be at least 1"
+                    )
+                if overlap_kv_transfer and not fields["stream_kv_layers"]:
+                    raise ValueError(
+                        "KV transfer overlap requires streamed KV layers"
+                    )
                 model_reloaded = _ensure_model(
                     fields.get("model_name"),
                     fields.get("torch_dtype"),
@@ -294,32 +356,86 @@ async def session(websocket: WebSocket):
                 )
                 kv_bytes = 0
                 extraction_ms = 0.0
-                forward_started = now_ns()
-                with torch.no_grad():
-                    for local_idx, layer in enumerate(layers):
-                        global_idx = PREFILL_EDGE_LAYERS + local_idx
-                        hidden = _layer_hidden(layer(
+                stream_metrics = {}
+                if overlap_kv_transfer:
+                    producer_result, stream_stats = await stream_from_worker(
+                        lambda emit: _produce_prefill_frames(
                             hidden,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids_t,
-                            use_cache=True,
-                            position_embeddings=position_embeddings,
-                            **_cache_argument(layer, cache),
-                        ))
-                        if global_idx < decode_layers:
-                            extraction_started = now_ns()
-                            key, value = extract_kv_delta(
-                                cache, global_idx, offset, count, "fp16"
+                            position_ids_t,
+                            attention_mask,
+                            position_embeddings,
+                            cache,
+                            offset,
+                            count,
+                            decode_layers,
+                            emit,
+                        ),
+                        websocket.send_bytes,
+                        max_queue_size=kv_transfer_queue_depth,
+                    )
+                    logits = producer_result["logits"]
+                    forward_started = producer_result["forward_started_ns"]
+                    forward_finished = producer_result["forward_finished_ns"]
+                    extraction_ms = producer_result["kv_extraction_ms"]
+                    kv_bytes = producer_result["kv_bytes"]
+                    final_send_ns = stream_stats[
+                        "kv_final_send_finished_ns"
+                    ]
+                    producer_finished_ns = stream_stats[
+                        "kv_producer_finished_ns"
+                    ]
+                    stream_metrics = {
+                        "kv_send_ms": stream_stats["kv_send_ms"],
+                        "kv_queue_wait_ms": stream_stats[
+                            "kv_queue_wait_ms"
+                        ],
+                        "kv_max_queue_depth": stream_stats[
+                            "kv_max_queue_depth"
+                        ],
+                        "kv_frames_sent": stream_stats["kv_frames_sent"],
+                        "kv_transfer_drain_ms": (
+                            max(
+                                0.0,
+                                elapsed_ms(
+                                    producer_finished_ns,
+                                    final_send_ns,
+                                ),
                             )
-                            frame = codec.pack_kv_delta(
-                                global_idx, offset, key, value
-                            )
-                            extraction_ms += elapsed_ms(extraction_started)
-                            kv_bytes += len(frame)
-                            await websocket.send_bytes(frame)
-                    hidden = model.model.norm(hidden)
-                    logits = model.lm_head(hidden)
-                forward_finished = now_ns()
+                            if final_send_ns else 0.0
+                        ),
+                        "kv_compute_send_overlap": stream_stats[
+                            "kv_compute_send_overlap"
+                        ],
+                    }
+                else:
+                    forward_started = now_ns()
+                    with torch.no_grad():
+                        for local_idx, layer in enumerate(layers):
+                            global_idx = PREFILL_EDGE_LAYERS + local_idx
+                            hidden = _layer_hidden(layer(
+                                hidden,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids_t,
+                                use_cache=True,
+                                position_embeddings=position_embeddings,
+                                **_cache_argument(layer, cache),
+                            ))
+                            if global_idx < decode_layers:
+                                extraction_started = now_ns()
+                                key, value = extract_kv_delta(
+                                    cache, global_idx, offset, count, "fp16"
+                                )
+                                frame = codec.pack_kv_delta(
+                                    global_idx, offset, key, value
+                                )
+                                extraction_ms += elapsed_ms(
+                                    extraction_started
+                                )
+                                kv_bytes += len(frame)
+                                await websocket.send_bytes(frame)
+                        hidden = model.model.norm(hidden)
+                        logits = model.lm_head(hidden)
+                    forward_finished = now_ns()
                 past_len += count
                 metrics = {
                     "cloud_prefill_ms": elapsed_ms(
@@ -329,6 +445,8 @@ async def session(websocket: WebSocket):
                     "kv_bytes": kv_bytes,
                     "chunk_total_ms": elapsed_ms(request_started),
                     "request_bytes": len(data),
+                    "overlap_kv_transfer": overlap_kv_transfer,
+                    **stream_metrics,
                 }
                 await websocket.send_bytes(
                     codec.pack_chunk_complete(offset, count, metrics)

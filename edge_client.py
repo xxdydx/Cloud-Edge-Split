@@ -117,6 +117,10 @@ class EdgeClient:
                     prefill_chunk_size=self.config.prefill_chunk_size,
                     stream_kv_layers=self.config.stream_kv_layers,
                     kv_transfer_dtype=self.config.kv_transfer_dtype,
+                    overlap_kv_transfer=self.config.overlap_kv_transfer,
+                    kv_transfer_queue_depth=(
+                        self.config.kv_transfer_queue_depth
+                    ),
                     benchmark_enabled=self._benchmark is not None,
                     model_name=self.config.model_name,
                     torch_dtype=str(self.config.torch_dtype),

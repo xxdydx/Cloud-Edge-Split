@@ -22,7 +22,8 @@ class InferenceConfig:
     prefill_chunk_size: int = 64
     stream_kv_layers: bool = True
     kv_transfer_dtype: str = "fp16"
-    overlap_kv_transfer: bool = False
+    overlap_kv_transfer: bool = True
+    kv_transfer_queue_depth: int = 1
     speculative_decoding: bool = False
     num_draft_tokens: int = 3
     max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "10"))
@@ -56,8 +57,10 @@ class InferenceConfig:
             raise ValueError("model_load_timeout_seconds must be positive")
         if self.kv_transfer_dtype != "fp16":
             raise ValueError("only exact fp16 KV transfer is currently supported")
-        if self.overlap_kv_transfer:
-            raise ValueError("asynchronous KV transfer overlap is not implemented")
+        if self.kv_transfer_queue_depth < 1:
+            raise ValueError("kv_transfer_queue_depth must be at least 1")
+        if self.overlap_kv_transfer and not self.stream_kv_layers:
+            raise ValueError("KV transfer overlap requires streamed KV layers")
         if self.speculative_decoding and (
             self.prefill_edge_layers != self.decode_edge_layers
         ):
