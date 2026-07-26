@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 
 
 def _install_missing_dependencies():
@@ -14,6 +15,8 @@ def _install_missing_dependencies():
         "accelerate": "accelerate",
         "fastapi": "fastapi",
         "pyngrok": "pyngrok",
+        "psutil": "psutil",
+        "pynvml": "nvidia-ml-py",
         "transformers": "transformers",
         "uvicorn": "uvicorn[standard]",
     }
@@ -44,6 +47,7 @@ from transformers import AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
 import activation_codec as codec
+from benchmarking import TelemetrySampler, elapsed_ms, now_ns
 from model_loading import load_partial_model, num_hidden_layers
 
 
@@ -60,6 +64,7 @@ EDGE_LAYERS = int(os.getenv("EDGE_LAYERS", "14"))
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
+model_load_started = time.perf_counter()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 TOTAL_LAYERS = num_hidden_layers(MODEL_NAME)
 # Only this device's own layer range + lm_head; no embed_tokens is needed
@@ -68,6 +73,7 @@ model = load_partial_model(
     MODEL_NAME, TORCH_DTYPE, DEVICE,
     EDGE_LAYERS, TOTAL_LAYERS, need_embed=False, need_lm_head=True,
 )
+MODEL_LOAD_SECONDS = time.perf_counter() - model_load_started
 layers = model.model.layers
 
 app = FastAPI()
@@ -159,6 +165,7 @@ async def session(websocket: WebSocket):
     cache = None
     edge_layers = None
     past_len = 0
+    telemetry = None
 
     try:
         while True:
@@ -166,28 +173,68 @@ async def session(websocket: WebSocket):
             msg_type = codec.message_type(data)
 
             if msg_type == codec.MSG_SESSION_START:
-                edge_layers = codec.unpack_session_start(data)
+                edge_layers, benchmark_enabled = codec.unpack_session_start(data)
                 _validate_edge_layers(edge_layers)
                 cache = DynamicCache()
                 past_len = 0
-                await websocket.send_bytes(codec.pack_ok())
+                if telemetry is not None:
+                    telemetry.stop()
+                telemetry = (
+                    TelemetrySampler(
+                        interval_ms=int(os.getenv("TELEMETRY_INTERVAL_MS", "100")),
+                        enable_nvml=True,
+                    )
+                    if benchmark_enabled else None
+                )
+                if telemetry:
+                    telemetry.start()
+                await websocket.send_bytes(codec.pack_ok({
+                    "cloud_model_load_ms": MODEL_LOAD_SECONDS * 1000,
+                    "cloud_compute_dtype": str(TORCH_DTYPE),
+                    "cloud_device": DEVICE,
+                } if benchmark_enabled else None))
                 continue
 
             if msg_type == codec.MSG_DECODE:
+                request_started = now_ns()
+                if telemetry:
+                    telemetry.capture()
                 if cache is None:
                     raise ValueError("Session not started")
+                decode_started = now_ns()
                 dtype, seq_len, hidden_dim, position_ids, scales, payload = codec.unpack_decode(data)
                 hidden, position_ids_t = _decode_tensors(
                     dtype, seq_len, hidden_dim, position_ids, scales, payload
                 )
+                decode_finished = now_ns()
+                forward_started = now_ns()
                 with torch.no_grad():
                     logits = cloud_forward(hidden, position_ids_t, cache, past_len)
                     next_token = logits[:, -1, :].argmax(-1).item()
+                forward_finished = now_ns()
                 past_len += hidden.shape[1]
-                await websocket.send_bytes(codec.pack_decode_reply(next_token))
+                if telemetry:
+                    telemetry.capture()
+                metrics = {
+                    "activation_decode_ms": elapsed_ms(decode_started, decode_finished),
+                    "cloud_forward_ms": elapsed_ms(forward_started, forward_finished),
+                    "server_processing_ms": elapsed_ms(request_started),
+                    "request_bytes": len(data),
+                    "telemetry": (
+                        telemetry.summarize(request_started, now_ns())
+                        if telemetry else {}
+                    ),
+                } if telemetry else None
+                await websocket.send_bytes(
+                    codec.pack_decode_reply(next_token, metrics)
+                )
                 continue
 
             if msg_type == codec.MSG_VERIFY:
+                request_started = now_ns()
+                if telemetry:
+                    telemetry.capture()
+                decode_started = now_ns()
                 fields = codec.unpack_verify(data)
                 _validate_edge_layers(fields["edge_layers"])
                 context_length = fields["context_length"]
@@ -204,13 +251,16 @@ async def session(websocket: WebSocket):
                     fields["scales"],
                     fields["payload"],
                 )
+                decode_finished = now_ns()
                 expected_length = context_length + len(draft_ids)
                 if hidden.shape[1] != expected_length:
                     raise ValueError("Hidden-state length does not match context plus drafts")
 
+                forward_started = now_ns()
                 with torch.no_grad():
                     logits = cloud_forward(hidden, position_ids_t, DynamicCache(), 0)
                     predicted = logits[0].argmax(-1)
+                forward_finished = now_ns()
 
                 accepted_count = 0
                 for index, draft_id in enumerate(draft_ids.tolist()):
@@ -221,7 +271,23 @@ async def session(websocket: WebSocket):
 
                 bonus_index = context_length - 1 + accepted_count
                 bonus_token = predicted[bonus_index].item()
-                await websocket.send_bytes(codec.pack_verify_reply(accepted_count, bonus_token))
+                if telemetry:
+                    telemetry.capture()
+                metrics = {
+                    "activation_decode_ms": elapsed_ms(decode_started, decode_finished),
+                    "cloud_forward_ms": elapsed_ms(forward_started, forward_finished),
+                    "server_processing_ms": elapsed_ms(request_started),
+                    "request_bytes": len(data),
+                    "telemetry": (
+                        telemetry.summarize(request_started, now_ns())
+                        if telemetry else {}
+                    ),
+                } if telemetry else None
+                await websocket.send_bytes(codec.pack_verify_reply(
+                    accepted_count,
+                    bonus_token,
+                    metrics,
+                ))
                 continue
 
     except WebSocketDisconnect:
@@ -229,6 +295,9 @@ async def session(websocket: WebSocket):
     except (ValueError, RuntimeError) as error:
         await websocket.send_bytes(bytes([codec.MSG_ERROR]) + str(error).encode())
         await websocket.close()
+    finally:
+        if telemetry is not None:
+            telemetry.stop()
 
 
 @app.get("/ping")

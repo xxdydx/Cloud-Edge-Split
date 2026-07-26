@@ -8,6 +8,7 @@ has to physically cross the network at the edge/cloud split point.
 """
 
 import struct
+import json
 
 import numpy as np
 import torch
@@ -31,9 +32,11 @@ _HEADER_FMT = "<BBII"        # msg_type, dtype, seq_len, hidden_dim
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 _VERIFY_EXTRA_FMT = "<IHH"   # context_length, num_draft, edge_layers
 _VERIFY_EXTRA_SIZE = struct.calcsize(_VERIFY_EXTRA_FMT)
-_SESSION_START_FMT = "<BH"   # msg_type, edge_layers
+_SESSION_START_FMT = "<BHB"  # msg_type, edge_layers, benchmark_enabled
 _DECODE_REPLY_FMT = "<Bi"    # msg_type, next_token
 _VERIFY_REPLY_FMT = "<BIi"   # msg_type, accepted_count, bonus_token
+_METRICS_LENGTH_FMT = "<I"
+_METRICS_LENGTH_SIZE = struct.calcsize(_METRICS_LENGTH_FMT)
 
 
 def dtype_code(dtype):
@@ -111,21 +114,50 @@ def decode_activation(payload, scales, dtype, seq_len, hidden_dim, device, model
 
 # --- framing ------------------------------------------------------------
 
-def pack_session_start(edge_layers):
-    return struct.pack(_SESSION_START_FMT, MSG_SESSION_START, edge_layers)
+def _pack_metrics(metrics):
+    payload = (
+        json.dumps(metrics, separators=(",", ":")).encode()
+        if metrics else b""
+    )
+    return struct.pack(_METRICS_LENGTH_FMT, len(payload)) + payload
+
+
+def _unpack_metrics(data, offset):
+    if len(data) < offset + _METRICS_LENGTH_SIZE:
+        return {}
+    (length,) = struct.unpack(
+        _METRICS_LENGTH_FMT,
+        data[offset: offset + _METRICS_LENGTH_SIZE],
+    )
+    if not length:
+        return {}
+    payload = data[
+        offset + _METRICS_LENGTH_SIZE:
+        offset + _METRICS_LENGTH_SIZE + length
+    ]
+    return json.loads(payload)
+
+
+def pack_session_start(edge_layers, benchmark_enabled=False):
+    return struct.pack(
+        _SESSION_START_FMT,
+        MSG_SESSION_START,
+        edge_layers,
+        int(benchmark_enabled),
+    )
 
 
 def unpack_session_start(data):
-    _, edge_layers = struct.unpack(_SESSION_START_FMT, data)
-    return edge_layers
+    _, edge_layers, benchmark_enabled = struct.unpack(_SESSION_START_FMT, data)
+    return edge_layers, bool(benchmark_enabled)
 
 
-def pack_ok():
-    return bytes([MSG_OK])
+def pack_ok(metrics=None):
+    return bytes([MSG_OK]) + _pack_metrics(metrics)
 
 
 def unpack_ok(data):
-    return None
+    return _unpack_metrics(data, 1)
 
 
 def pack_decode(hidden, position_ids, dtype):
@@ -192,22 +224,41 @@ def unpack_verify(data):
     }
 
 
-def pack_decode_reply(next_token):
-    return struct.pack(_DECODE_REPLY_FMT, MSG_DECODE_REPLY, next_token)
+def pack_decode_reply(next_token, metrics=None):
+    return (
+        struct.pack(_DECODE_REPLY_FMT, MSG_DECODE_REPLY, next_token)
+        + _pack_metrics(metrics)
+    )
 
 
 def unpack_decode_reply(data):
-    _, next_token = struct.unpack(_DECODE_REPLY_FMT, data)
-    return next_token
+    reply_size = struct.calcsize(_DECODE_REPLY_FMT)
+    _, next_token = struct.unpack(_DECODE_REPLY_FMT, data[:reply_size])
+    return next_token, _unpack_metrics(
+        data,
+        reply_size,
+    )
 
 
-def pack_verify_reply(accepted_count, bonus_token):
-    return struct.pack(_VERIFY_REPLY_FMT, MSG_VERIFY_REPLY, accepted_count, bonus_token)
+def pack_verify_reply(accepted_count, bonus_token, metrics=None):
+    return (
+        struct.pack(
+            _VERIFY_REPLY_FMT,
+            MSG_VERIFY_REPLY,
+            accepted_count,
+            bonus_token,
+        )
+        + _pack_metrics(metrics)
+    )
 
 
 def unpack_verify_reply(data):
-    _, accepted_count, bonus_token = struct.unpack(_VERIFY_REPLY_FMT, data)
-    return accepted_count, bonus_token
+    reply_size = struct.calcsize(_VERIFY_REPLY_FMT)
+    _, accepted_count, bonus_token = struct.unpack(
+        _VERIFY_REPLY_FMT,
+        data[:reply_size],
+    )
+    return accepted_count, bonus_token, _unpack_metrics(data, reply_size)
 
 
 def message_type(data):

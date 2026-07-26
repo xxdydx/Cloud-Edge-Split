@@ -19,6 +19,10 @@ class InferenceConfig:
     activation_dtype: str = "fp16"  # "fp32", "fp16", or "int4"
     device: str = "mps" if torch.backends.mps.is_available() else "cpu"
     warmup_on_start: bool = True
+    benchmark_enabled: bool = True
+    benchmark_output: str = "benchmarks/results.jsonl"
+    telemetry_interval_ms: int = 100
+    edge_power_sampler: str = "powermetrics"  
 
     @property
     def cloud_ws_url(self):

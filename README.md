@@ -12,12 +12,33 @@ Edge inference settings live in `config.py`. In particular:
 - Set `num_draft_tokens` to the maximum speculative block size.
 - Set `warmup_on_start` to `True` to warm the edge and cloud kernels before
   accepting the first prompt.
+- Set `benchmark_enabled` to record per-generation and per-request metrics in
+  `benchmark_output` (default: `benchmarks/results.jsonl`).
 
 Start the cloud server with `AUTH_TOKEN=<your-ngrok-token> python CLOUD.py`,
 then run `python edge_client.py`. The edge model is loaded once and the process
 waits for prompts until `/quit`, `/exit`, EOF, or Ctrl-C. Each prompt receives
 fresh edge and cloud KV caches while the model weights and WebSocket connection
 remain resident.
+
+## benchmarking
+
+When benchmarking is enabled, every prompt prints a short TTFT, inter-token
+latency, throughput, and byte-count summary. A full JSONL record is appended to
+`benchmarks/results.jsonl`, including:
+
+- TTFT, inter-token latency distribution, total generation time, and tokens/s
+- edge forward, activation encoding, WebSocket, and cloud-forward timings
+- raw/encoded activation sizes, complete binary-frame sizes, and compression
+  ratio (TCP/TLS/WebSocket framing overhead is excluded)
+- edge process CPU/RAM and MPS allocation statistics
+- cloud CPU/RAM plus NVIDIA GPU utilization, memory, temperature, power, and
+  energy when NVML exposes them
+- speculative acceptance and response-chunk information
+
+On macOS, `powermetrics` energy sampling is best-effort and uses non-interactive
+`sudo -n`; if it is not already authorized, the JSON record marks edge energy
+as unsupported rather than prompting for a password or estimating a value.
 
 ## current implementation
 
@@ -27,13 +48,7 @@ states will be sent up to the cloud, and forward pass for remaining N-K layers
 will be computed.
 
 ## to-do items
-- replace JSON float lists with quantised (fp16/fp4/int4) binary activation transfer
-- boundary activation compression
-- replace HTTP requests w/ persistent websockets
-- cloud shd only load layers K...N-1. same for edge, 0...N
 - diff K split for prefill & decode
-
-- benchmarks: TTFT, Inter-token latency, boundary activation size, total gen time, bytes transferred, edge mem/energy util, cloud util, gpu/cpu utils
 
 <!-- ### cons of current implementation
 - every generated token costs one full round trip, edge device computes K layers -> network hop -> cloud computes N-K layers -> network hop back to edge device.
@@ -76,7 +91,5 @@ however, `load_partial_model()` loads the full model in entirety on each device 
 **improvements**
 - for it to see tangible improvement, edge layers shd be reduced to less than 12, but not practical as the final LM head was not trained to decode intermediate representations reliably.
 - a meaningful improvement wld require training a separate auxillary early-exit head, or using a cheaper draft model and verify using larger model on cloud.
-
-
 
 
