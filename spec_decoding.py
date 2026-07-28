@@ -46,7 +46,24 @@ def run_edge_layers(model, input_ids, cache, edge_layers, past_len=0):
     position_embeddings = model.model.rotary_emb(hidden, position_ids)
     attention_mask = causal_attention_mask(hidden, position_ids, past_len)
 
-    for layer in model.model.layers[:edge_layers]:
+    quantization_start = getattr(
+        model,
+        "_edge_quantization_start_layer",
+        None,
+    )
+    quantization_dtype = getattr(
+        model,
+        "_edge_quantization_activation_dtype",
+        None,
+    )
+    for layer_idx, layer in enumerate(model.model.layers[:edge_layers]):
+        if (
+            layer_idx == quantization_start
+            and quantization_dtype is not None
+            and hidden.dtype != quantization_dtype
+        ):
+            hidden = hidden.to(quantization_dtype)
+            attention_mask = attention_mask.to(quantization_dtype)
         hidden = _layer_hidden(layer(
             hidden,
             attention_mask=attention_mask,

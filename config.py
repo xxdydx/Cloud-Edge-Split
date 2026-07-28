@@ -24,6 +24,12 @@ class InferenceConfig:
     kv_transfer_dtype: str = "fp16"
     overlap_kv_transfer: bool = True
     kv_transfer_queue_depth: int = 4
+    edge_overlap_quantization: str = "mixed"  # "none" or "mixed"
+    edge_overlap_attention_bits: int = 8
+    edge_overlap_ffn_bits: int = 4
+    edge_int4_group_size: int = 64
+    edge_quantization_backend: str = "auto"  # auto, pytorch, or torchao
+    allow_quantization_fallback: bool = True
     speculative_decoding: bool = False
     num_draft_tokens: int = 3
     max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "100"))
@@ -61,6 +67,22 @@ class InferenceConfig:
             raise ValueError("kv_transfer_queue_depth must be at least 1")
         if self.overlap_kv_transfer and not self.stream_kv_layers:
             raise ValueError("KV transfer overlap requires streamed KV layers")
+        if self.edge_overlap_quantization not in {"none", "mixed"}:
+            raise ValueError("edge_overlap_quantization must be none or mixed")
+        if self.edge_overlap_quantization == "mixed" and (
+            self.edge_overlap_attention_bits != 8
+            or self.edge_overlap_ffn_bits != 4
+        ):
+            raise ValueError(
+                "mixed overlap quantization currently requires INT8 "
+                "attention and INT4 FFN"
+            )
+        if self.edge_int4_group_size not in {32, 64, 128}:
+            raise ValueError("edge INT4 group size must be 32, 64, or 128")
+        if self.edge_quantization_backend not in {
+            "auto", "pytorch", "torchao"
+        }:
+            raise ValueError("unknown edge quantization backend")
         if self.speculative_decoding and (
             self.prefill_edge_layers != self.decode_edge_layers
         ):

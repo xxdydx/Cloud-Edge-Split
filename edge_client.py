@@ -22,6 +22,7 @@ from benchmarking import (
     now_ns,
 )
 from config import CONFIG
+from edge_quantization import quantize_overlap_layers
 from model_loading import load_partial_model, num_hidden_layers
 from cache_migration import assert_cache_lengths, install_kv_delta
 from spec_decoding import draft_and_prepare_verification, run_edge_layers
@@ -36,6 +37,10 @@ class EdgeClient:
         self._benchmark = None
         self._telemetry = None
         self._power_sampler = None
+        self.quantization_metadata = {
+            "requested_mode": "none",
+            "backend": "none",
+        }
 
         load_started = time.perf_counter()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
@@ -51,6 +56,10 @@ class EdgeClient:
                 config.decode_edge_layers,
                 need_embed=True,
                 need_lm_head=config.speculative_decoding,
+            )
+            self.quantization_metadata = quantize_overlap_layers(
+                self.model,
+                config,
             )
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -659,6 +668,9 @@ class EdgeClient:
                 self.config,
                 self.model_load_seconds,
             )
+            self._benchmark.setup["edge_quantization"] = (
+                self.quantization_metadata
+            )
             self._telemetry = TelemetrySampler(
                 interval_ms=self.config.telemetry_interval_ms,
             )
@@ -828,6 +840,16 @@ def main():
     print("Loading edge model...")
     client = EdgeClient()
     print(f"Model ready in {client.model_load_seconds:.2f}s on {CONFIG.device}.")
+    quantization = client.quantization_metadata
+    if quantization.get("requested_mode") != "none":
+        print(
+            "Edge overlap quantization: "
+            f"attention INT{quantization['effective_attention_bits']}, "
+            f"FFN INT{quantization['effective_ffn_bits']} via "
+            f"{quantization['backend']}."
+        )
+        if quantization.get("fallback_reason"):
+            print(f"Quantization fallback: {quantization['fallback_reason']}")
 
     try:
         if CONFIG.split_inference:

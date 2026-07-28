@@ -1,8 +1,12 @@
 import asyncio
 import threading
 import unittest
+from types import SimpleNamespace
 
 import torch
+from torch import nn
+from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers.cache_utils import DynamicCache
 
 import activation_codec as codec
 from cache_migration import (
@@ -11,6 +15,7 @@ from cache_migration import (
     install_kv_delta,
 )
 from kv_streaming import stream_from_worker
+from edge_quantization import quantize_overlap_layers
 
 
 class FakeDynamicCache:
@@ -211,6 +216,179 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
                 stream_from_worker(produce, send, max_queue_size=1),
                 timeout=2,
             )
+
+
+class _FakeLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = nn.Sequential(
+            nn.Linear(16, 16, bias=False),
+            nn.Linear(16, 16, bias=False),
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(16, 32, bias=False),
+            nn.Linear(32, 16, bias=False),
+        )
+
+
+class _FakeModel(nn.Module):
+    def __init__(self, layer_count=3):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([
+            _FakeLayer() for _ in range(layer_count)
+        ])
+
+
+def _quant_config(**overrides):
+    fields = {
+        "prefill_edge_layers": 1,
+        "decode_edge_layers": 3,
+        "edge_overlap_quantization": "mixed",
+        "edge_overlap_attention_bits": 8,
+        "edge_overlap_ffn_bits": 4,
+        "edge_int4_group_size": 64,
+        "edge_quantization_backend": "pytorch",
+        "allow_quantization_fallback": True,
+        "device": "cpu",
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class QuantizationTests(unittest.TestCase):
+    def test_none_leaves_every_layer_unmodified(self):
+        model = _FakeModel()
+        first_types = [
+            type(layer.self_attn[0]) for layer in model.model.layers
+        ]
+        result = quantize_overlap_layers(
+            model,
+            _quant_config(edge_overlap_quantization="none"),
+        )
+        self.assertEqual(result["effective_attention_bits"], 16)
+        self.assertEqual(result["effective_ffn_bits"], 16)
+        self.assertEqual(
+            [type(layer.self_attn[0]) for layer in model.model.layers],
+            first_types,
+        )
+
+    def test_pytorch_quantizes_only_overlap_layers(self):
+        model = _FakeModel()
+        result = quantize_overlap_layers(model, _quant_config())
+
+        self.assertIsInstance(model.model.layers[0].self_attn[0], nn.Linear)
+        for layer in model.model.layers[1:3]:
+            self.assertIsInstance(
+                layer.self_attn[0],
+                torch.ao.nn.quantized.dynamic.Linear,
+            )
+            self.assertIsInstance(
+                layer.mlp[0],
+                torch.ao.nn.quantized.dynamic.Linear,
+            )
+            output = layer.self_attn(torch.randn(1, 1, 16))
+            self.assertEqual(output.shape, (1, 1, 16))
+
+        self.assertEqual(result["effective_attention_bits"], 8)
+        self.assertEqual(result["effective_ffn_bits"], 8)
+        self.assertEqual(result["overlap_start_layer"], 1)
+        self.assertEqual(result["overlap_end_layer"], 3)
+        self.assertIn("INT4 backend unavailable", result["fallback_reason"])
+        self.assertEqual(
+            model._edge_quantization_activation_dtype,
+            torch.float32,
+        )
+        self.assertLess(
+            result["estimated_weight_bytes_after"],
+            result["estimated_weight_bytes_before"],
+        )
+
+    def test_strict_int4_rejects_fallback(self):
+        model = _FakeModel()
+        with self.assertRaisesRegex(RuntimeError, "INT4 backend unavailable"):
+            quantize_overlap_layers(
+                model,
+                _quant_config(allow_quantization_fallback=False),
+            )
+
+    def test_quantized_qwen_overlap_forward_and_cache_growth(self):
+        from spec_decoding import run_edge_layers
+
+        model = Qwen2ForCausalLM(Qwen2Config(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+        )).half().eval()
+        quantize_overlap_layers(model, _quant_config())
+        cache = DynamicCache()
+
+        hidden, _ = run_edge_layers(
+            model,
+            torch.tensor([[1, 2, 3]]),
+            cache,
+            edge_layers=3,
+            past_len=0,
+        )
+        self.assertEqual(hidden.dtype, torch.float32)
+        self.assertEqual([item.shape[-2] for item in cache.key_cache], [3] * 3)
+        self.assertEqual(
+            [item.dtype for item in cache.key_cache],
+            [torch.float16, torch.float32, torch.float32],
+        )
+
+        hidden, _ = run_edge_layers(
+            model,
+            torch.tensor([[4]]),
+            cache,
+            edge_layers=3,
+            past_len=3,
+        )
+        self.assertEqual(hidden.shape, (1, 1, 16))
+        self.assertEqual([item.shape[-2] for item in cache.key_cache], [4] * 3)
+
+    def test_quantized_decode_accepts_migrated_fp16_prompt_cache(self):
+        from spec_decoding import run_edge_layers
+
+        model = Qwen2ForCausalLM(Qwen2Config(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+        )).half().eval()
+        quantize_overlap_layers(model, _quant_config())
+        cache = DynamicCache()
+
+        run_edge_layers(
+            model,
+            torch.tensor([[1, 2, 3]]),
+            cache,
+            edge_layers=1,
+            past_len=0,
+        )
+        migrated = torch.randn(1, 2, 3, 4, dtype=torch.float16)
+        install_kv_delta(cache, 1, 0, migrated, migrated.clone())
+        install_kv_delta(cache, 2, 0, migrated, migrated.clone())
+
+        hidden, _ = run_edge_layers(
+            model,
+            torch.tensor([[4]]),
+            cache,
+            edge_layers=3,
+            past_len=3,
+        )
+        self.assertEqual(hidden.shape, (1, 1, 16))
+        self.assertEqual([item.shape[-2] for item in cache.key_cache], [4] * 3)
+        self.assertEqual(cache.key_cache[0].dtype, torch.float16)
+        self.assertEqual(cache.key_cache[1].dtype, torch.float32)
+        self.assertEqual(cache.key_cache[2].dtype, torch.float32)
 
 
 if __name__ == "__main__":

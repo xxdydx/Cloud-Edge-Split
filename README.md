@@ -9,7 +9,8 @@ Edge inference settings live in `config.py`. In particular:
 - Set `speculative_decoding` to `True` to use batched draft verification, or `False` to use the original token-by-token path.
 - Set `prefill_edge_layers` and `decode_edge_layers` to the edge layer counts for prompt processing and token decoding. They must satisfy `0 < prefill_edge_layers <= decode_edge_layers < total_layers`.
 - `chunked_prefill=True` divides prompts into `prefill_chunk_size` token chunks (64 by default).
-- `overlap_kv_transfer=True` streams each migrated layer's KV frame while the cloud computes subsequent layers. `kv_transfer_queue_depth` bounds buffered frames and defaults to 1; set `overlap_kv_transfer=False` for the synchronous comparison path.
+- `overlap_kv_transfer=True` streams each migrated layer's KV frame while the cloud computes subsequent layers. `kv_transfer_queue_depth` bounds buffered frames; set `overlap_kv_transfer=False` for the synchronous comparison path.
+- `edge_overlap_quantization="mixed"` enables selective quantisation of the decode-only edge layers described below. `edge_quantization_backend="auto"` uses TorchAO when available and records any fallback in the benchmark metadata.
 - Set `num_draft_tokens` to the maximum speculative block size.
 - Set `max_new_tokens`, or the `MAX_NEW_TOKENS` environment variable, to the generation limit selected by the edge and sent to the cloud for each prompt.
 - Set `warmup_on_start` to `True` to warm the edge and cloud kernels before accepting the first prompt.
@@ -84,6 +85,10 @@ During the initial experiments, the model was split evenly, with 14 layers on th
 For decode, the performance difference between the GPU and CPU is relatively small. The difference is substantially larger for prefill.
 
 This motivates using different split points by phase: assign fewer prefill layers to the edge and more to the cloud to exploit GPU parallelism, while choosing the decode split mainly around edge capacity, boundary-transfer cost, and per-token network latency. This also requires reworking the model-residency logic between devices.
+
+### Edge Overlap-Layer Quantisation
+
+Layers between the prefill and decode splits run on the edge only during decoding and are called **overlap layers** (e.g. layers 4–11 for a 4/12 split). Their attention and FFN linear weights use INT8 and INT4 respectively to reduce edge memory.
 
 ### First Dual-K Experiment
 
@@ -184,3 +189,27 @@ Frame count is identical (one message per migrated layer, 8 layers) across both 
 **Improvements**
 - Achieving a tangible improvement would require fewer than 12 edge layers, but this is impractical because the final LM head was not trained to decode intermediate representations reliably.
 - A meaningful improvement would require training a separate auxiliary early-exit head or using a cheaper draft model and a larger cloud verifier model.
+
+
+## To-dos
+
+### Join prefill/decode split selection
+- Profiling each layer on both devices, for prefill/decode time, weight & KV memory, boundary-trf cost (time & bytes) for diff token lengths
+- T_req = T_prefill(s_p) + T_handoff(s_p, s_d) + N x T_decode(s_d)
+
+### Break-even-aware switching
+do only if decode savings recover the handoff cost
+
+N_breakeven = T_handoff / (T_decode(s_p) - T_decode(s_d))
+
+### Incremental KV streaming
+Divide prefill into token chunks and migrate concurrently with subsequent layer of prefill compute
+
+### Transfer vs remat
+Transfer when networking is faster, replay when edge compute is faster
+
+### Hybrid suffix remat
+Keep received KV pages, identify the missing causal suffix, replay only that suffix on the Mac
+
+### Deadline-aware scheduling
+Each KV chunk has a deadline,

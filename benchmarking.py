@@ -369,6 +369,22 @@ class BenchmarkRun:
                 "kv_transfer_queue_depth": (
                     self.config.kv_transfer_queue_depth
                 ),
+                "edge_overlap_quantization": (
+                    self.config.edge_overlap_quantization
+                ),
+                "edge_overlap_attention_bits": (
+                    self.config.edge_overlap_attention_bits
+                ),
+                "edge_overlap_ffn_bits": (
+                    self.config.edge_overlap_ffn_bits
+                ),
+                "edge_int4_group_size": self.config.edge_int4_group_size,
+                "edge_quantization_backend": (
+                    self.config.edge_quantization_backend
+                ),
+                "allow_quantization_fallback": (
+                    self.config.allow_quantization_fallback
+                ),
                 "speculative_decoding": self.config.speculative_decoding,
                 "edge_compute_dtype": str(self.config.torch_dtype),
                 "activation_dtype": self.config.activation_dtype,
