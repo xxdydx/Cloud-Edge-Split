@@ -37,6 +37,7 @@ class EdgeClient:
         self._benchmark = None
         self._telemetry = None
         self._power_sampler = None
+        self._cloud_model_ready = False
         self.quantization_metadata = {
             "requested_mode": "none",
             "backend": "none",
@@ -110,7 +111,7 @@ class EdgeClient:
             raise RuntimeError(data[1:].decode())
         return unpack(data), len(data)
 
-    def _start_session(self, max_new_tokens):
+    def _start_session(self, max_new_tokens, allow_model_load=False):
         """Reset cloud KV state, reconnecting once if the socket went stale."""
         session_started = now_ns()
         reused_connection = self.ws is not None
@@ -133,6 +134,7 @@ class EdgeClient:
                     benchmark_enabled=self._benchmark is not None,
                     model_name=self.config.model_name,
                     torch_dtype=str(self.config.torch_dtype),
+                    allow_model_load=allow_model_load,
                 ))
                 session_metrics, _ = self._read_reply(
                     codec.unpack_ok,
@@ -145,7 +147,12 @@ class EdgeClient:
                     )
                     self._benchmark.setup["websocket_reused"] = reused_connection
                     self._benchmark.setup["session_attempts"] = attempt + 1
-                return
+                if not session_metrics.get("cloud_model_resident", True):
+                    raise RuntimeError(
+                        "cloud acknowledged the session without a resident model"
+                    )
+                self._cloud_model_ready = True
+                return session_metrics
             except (ConnectionClosed, OSError, TimeoutError):
                 self.close_connection()
                 if attempt == 1:
@@ -287,6 +294,7 @@ class EdgeClient:
         for offset in range(0, prompt_len, chunk_size):
             request_started = now_ns()
             chunk = input_ids[:, offset:offset + chunk_size]
+            forward_started = now_ns()
             hidden, position_ids = run_edge_layers(
                 self.model,
                 chunk,
@@ -294,6 +302,9 @@ class EdgeClient:
                 self.config.prefill_edge_layers,
                 offset,
             )
+            self._synchronize_for_timing()
+            forward_finished = now_ns()
+            encode_started = now_ns()
             frame = codec.pack_prefill_chunk(
                 hidden,
                 position_ids,
@@ -301,7 +312,10 @@ class EdgeClient:
                 offset,
                 offset + chunk.shape[1] == prompt_len,
             )
+            encode_finished = now_ns()
+            send_started = now_ns()
             self.ws.send(frame)
+            send_finished = now_ns()
             reply_bytes = 0
             kv_bytes = 0
             kv_install_ms = 0.0
@@ -361,6 +375,18 @@ class EdgeClient:
                     "input_sequence_length": chunk.shape[1],
                     "output_tokens": 0,
                     "timings_ms": {
+                        "edge_forward": elapsed_ms(
+                            forward_started,
+                            forward_finished,
+                        ),
+                        "activation_encode": elapsed_ms(
+                            encode_started,
+                            encode_finished,
+                        ),
+                        "websocket_send": elapsed_ms(
+                            send_started,
+                            send_finished,
+                        ),
                         "round_total": elapsed_ms(request_started),
                         "kv_install": kv_install_ms,
                         "first_kv_arrival": (
@@ -420,6 +446,7 @@ class EdgeClient:
         while len(generated) < max_new_tokens and next_token != self.tokenizer.eos_token_id:
             started = time.perf_counter()
             request_started = now_ns()
+            forward_started = now_ns()
             hidden, position_ids = run_edge_layers(
                 self.model,
                 cur_token,
@@ -427,13 +454,20 @@ class EdgeClient:
                 self.config.decode_edge_layers,
                 past_len,
             )
+            self._synchronize_for_timing()
+            forward_finished = now_ns()
+            encode_started = now_ns()
             frame = codec.pack_decode(
                 hidden, position_ids, self.config.activation_dtype
             )
+            encode_finished = now_ns()
+            send_started = now_ns()
             self.ws.send(frame)
+            send_finished = now_ns()
             (next_token, cloud_metrics), reply_bytes = self._read_reply(
                 codec.unpack_decode_reply
             )
+            receive_finished = now_ns()
             generated.append(next_token)
             round_times.append(time.perf_counter() - started)
             past_len += 1
@@ -442,8 +476,25 @@ class EdgeClient:
                 self._benchmark.mark_tokens(1)
             self._record_request(
                 "decode", hidden, frame, reply_bytes, 1,
-                {"round_total": elapsed_ms(request_started)},
-                cloud_metrics, request_started, now_ns(),
+                {
+                    "edge_forward": elapsed_ms(
+                        forward_started,
+                        forward_finished,
+                    ),
+                    "activation_encode": elapsed_ms(
+                        encode_started,
+                        encode_finished,
+                    ),
+                    "websocket_send": elapsed_ms(
+                        send_started,
+                        send_finished,
+                    ),
+                    "round_total": elapsed_ms(
+                        request_started,
+                        receive_finished,
+                    ),
+                },
+                cloud_metrics, request_started, receive_finished,
             )
 
         round_times.insert(0, prefill_ms / 1000)
@@ -707,7 +758,10 @@ class EdgeClient:
                 else:
                     # Every prompt gets fresh edge/cloud KV caches while model
                     # weights and the WebSocket remain resident.
-                    self._start_session(max_new_tokens)
+                    self._start_session(
+                        max_new_tokens,
+                        allow_model_load=not self._cloud_model_ready,
+                    )
                     if (
                         self.config.prefill_edge_layers
                         != self.config.decode_edge_layers
@@ -800,6 +854,34 @@ class EdgeClient:
                     f"bytes={transport['total_application_bytes']}, "
                     f"saved={self.config.benchmark_output}"
                 )
+                ttft_parts = latency.get("ttft_breakdown_ms") or {}
+                if ttft_parts:
+                    print(
+                        "TTFT breakdown (ms): "
+                        f"edge_fwd={ttft_parts['edge_forward']:.2f}, "
+                        f"edge_pack/send="
+                        f"{ttft_parts['edge_serialization_and_send']:.2f}, "
+                        f"cloud_fwd={ttft_parts['cloud_forward']:.2f}, "
+                        f"cloud_other={ttft_parts['cloud_other']:.2f}, "
+                        f"network/tunnel/queue="
+                        f"{ttft_parts['network_tunnel_and_queue']:.2f}, "
+                        f"session={ttft_parts['session_handshake']:.2f}, "
+                        f"tokenize/client_other="
+                        f"{ttft_parts['tokenization'] + ttft_parts['client_other']:.2f}"
+                    )
+                decode_parts = latency.get("decode_mean_breakdown_ms")
+                if decode_parts:
+                    print(
+                        "Decode mean breakdown (ms): "
+                        f"edge_fwd={decode_parts['edge_forward']:.2f}, "
+                        f"edge_pack/send="
+                        f"{decode_parts['edge_serialization_and_send']:.2f}, "
+                        f"cloud_fwd={decode_parts['cloud_forward']:.2f}, "
+                        f"cloud_other={decode_parts['cloud_other']:.2f}, "
+                        f"network/tunnel/queue="
+                        f"{decode_parts['network_tunnel_and_queue']:.2f}, "
+                        f"round={decode_parts['round_total']:.2f}"
+                    )
 
         return self.tokenizer.decode(input_ids[0].tolist() + generated)
 
@@ -811,14 +893,17 @@ class EdgeClient:
         ).input_ids.to(self.config.device)
         with torch.no_grad():
             if self.config.split_inference:
-                self._start_session(max_new_tokens=1)
+                self._start_session(
+                    max_new_tokens=2,
+                    allow_model_load=True,
+                )
                 if (
                     self.config.prefill_edge_layers
                     != self.config.decode_edge_layers
                 ):
-                    self._generate_varied_split(input_ids, max_new_tokens=1)
+                    self._generate_varied_split(input_ids, max_new_tokens=2)
                 else:
-                    self._generate_standard(input_ids, max_new_tokens=1)
+                    self._generate_standard(input_ids, max_new_tokens=2)
             else:
                 self._generate_local(input_ids, max_new_tokens=1)
 

@@ -32,7 +32,7 @@ class InferenceConfig:
     allow_quantization_fallback: bool = True
     speculative_decoding: bool = False
     num_draft_tokens: int = 3
-    max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "100"))
+    max_new_tokens: int = int(os.getenv("MAX_NEW_TOKENS", "10"))
     request_timeout_seconds: float = 60.0
     model_load_timeout_seconds: float = 900.0
     torch_dtype: torch.dtype = torch.float16

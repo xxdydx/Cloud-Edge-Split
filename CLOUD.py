@@ -127,7 +127,13 @@ def _wire_torch_dtype(name):
     return _DTYPES[normalized]
 
 
-def _ensure_model(model_name, torch_dtype_name, prefill_layers, decode_layers):
+def _ensure_model(
+    model_name,
+    torch_dtype_name,
+    prefill_layers,
+    decode_layers,
+    allow_model_load,
+):
     """Load the cloud range requested by the edge, reusing it when possible."""
     global model, layers, MODEL_NAME, TORCH_DTYPE, TOTAL_LAYERS
     global PREFILL_EDGE_LAYERS, MODEL_LOAD_SECONDS
@@ -147,6 +153,18 @@ def _ensure_model(model_name, torch_dtype_name, prefill_layers, decode_layers):
                 "layer splits must satisfy prefill <= decode < total"
             )
         return False
+
+    if not allow_model_load:
+        resident = (
+            f"{MODEL_NAME}, dtype={TORCH_DTYPE}, prefill_split="
+            f"{PREFILL_EDGE_LAYERS}"
+            if model is not None else "none"
+        )
+        raise RuntimeError(
+            "cloud model residency does not match this request and prompt-time "
+            "model loading is disabled. Run edge warm-up before entering a "
+            f"prompt. Resident model: {resident}"
+        )
 
     total_layers = num_hidden_layers(model_name)
     if not 0 < prefill_layers <= decode_layers < total_layers:
@@ -305,6 +323,7 @@ async def session(websocket: WebSocket):
                     fields.get("torch_dtype"),
                     prefill_layers,
                     decode_layers,
+                    fields["allow_model_load"],
                 )
                 cache = DynamicCache()
                 # Used by migration helpers with legacy compact-list caches.
@@ -322,7 +341,11 @@ async def session(websocket: WebSocket):
                 if telemetry:
                     telemetry.start()
                 await websocket.send_bytes(codec.pack_ok({
-                    "cloud_model_load_ms": MODEL_LOAD_SECONDS * 1000,
+                    "cloud_model_load_ms": (
+                        MODEL_LOAD_SECONDS * 1000 if model_reloaded else 0.0
+                    ),
+                    "cloud_model_initial_load_ms": MODEL_LOAD_SECONDS * 1000,
+                    "cloud_model_resident": True,
                     "cloud_compute_dtype": str(TORCH_DTYPE),
                     "cloud_device": DEVICE,
                     "max_new_tokens": max_new_tokens,

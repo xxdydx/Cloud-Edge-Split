@@ -325,6 +325,104 @@ class BenchmarkRun:
     def add_request(self, request):
         self.requests.append(request)
 
+    @staticmethod
+    def _request_latency_parts(request):
+        timings = request.get("timings_ms", {})
+        cloud = request.get("cloud", {})
+        round_total = timings.get("round_total", 0.0) or 0.0
+        edge_forward = timings.get("edge_forward", 0.0) or 0.0
+        edge_serialization = (
+            (timings.get("activation_encode", 0.0) or 0.0)
+            + (timings.get("websocket_send", 0.0) or 0.0)
+        )
+        cloud_forward = (
+            cloud.get("cloud_prefill_ms")
+            if request.get("type") == "prefill_chunk"
+            else cloud.get("cloud_forward_ms")
+        ) or 0.0
+        cloud_processing = (
+            cloud.get("chunk_total_ms")
+            if request.get("type") == "prefill_chunk"
+            else cloud.get("server_processing_ms")
+        ) or cloud_forward
+        cloud_other = max(0.0, cloud_processing - cloud_forward)
+        # The edge and cloud use different monotonic clocks, so uplink and
+        # downlink cannot be separated safely. The critical-path remainder is
+        # combined transport, tunnel, socket and server-queue wait.
+        network_and_queue = max(
+            0.0,
+            round_total
+            - edge_forward
+            - edge_serialization
+            - cloud_processing,
+        )
+        return {
+            "round_total": round_total,
+            "edge_forward": edge_forward,
+            "edge_serialization_and_send": edge_serialization,
+            "cloud_forward": cloud_forward,
+            "cloud_other": cloud_other,
+            "network_tunnel_and_queue": network_and_queue,
+        }
+
+    def _latency_breakdowns(self, ttft_ms):
+        prefill_requests = [
+            request for request in self.requests
+            if request.get("type") in {"prefill", "prefill_chunk"}
+        ]
+        prefill_parts = [
+            self._request_latency_parts(request)
+            for request in prefill_requests
+        ]
+        prefill_round_total = sum(
+            part["round_total"] for part in prefill_parts
+        )
+        tokenization = self.setup.get("tokenization_ms", 0.0) or 0.0
+        session = self.setup.get("session_handshake_ms", 0.0) or 0.0
+        client_other = max(
+            0.0,
+            (ttft_ms or 0.0)
+            - tokenization
+            - session
+            - prefill_round_total,
+        )
+        ttft = {
+            "total": ttft_ms,
+            "tokenization": tokenization,
+            "session_handshake": session,
+            "edge_forward": sum(
+                part["edge_forward"] for part in prefill_parts
+            ),
+            "edge_serialization_and_send": sum(
+                part["edge_serialization_and_send"]
+                for part in prefill_parts
+            ),
+            "cloud_forward": sum(
+                part["cloud_forward"] for part in prefill_parts
+            ),
+            "cloud_other": sum(
+                part["cloud_other"] for part in prefill_parts
+            ),
+            "network_tunnel_and_queue": sum(
+                part["network_tunnel_and_queue"]
+                for part in prefill_parts
+            ),
+            "client_other": client_other,
+        }
+
+        decode_parts = [
+            self._request_latency_parts(request)
+            for request in self.requests
+            if request.get("type") == "decode"
+        ]
+        decode_mean = None
+        if decode_parts:
+            decode_mean = {
+                key: statistics.fmean(part[key] for part in decode_parts)
+                for key in decode_parts[0]
+            }
+        return ttft, decode_mean
+
     def finish(
         self,
         generated_tokens,
@@ -349,6 +447,11 @@ class BenchmarkRun:
             item["bytes"].get("kv_migration", 0) for item in self.requests
         )
         total_ms = elapsed_ms(self.start_ns, end_ns)
+        ttft_ms = (
+            elapsed_ms(self.start_ns, self.first_token_ns)
+            if self.first_token_ns else None
+        )
+        ttft_breakdown, decode_breakdown = self._latency_breakdowns(ttft_ms)
         return {
             "schema_version": 1,
             "timestamp_unix": time.time(),
@@ -396,16 +499,15 @@ class BenchmarkRun:
             },
             "latency": {
                 "model_load_ms": self.model_load_seconds * 1000,
-                "ttft_ms": (
-                    elapsed_ms(self.start_ns, self.first_token_ns)
-                    if self.first_token_ns else None
-                ),
+                "ttft_ms": ttft_ms,
+                "ttft_breakdown_ms": ttft_breakdown,
                 "total_generation_ms": total_ms,
                 "output_tokens_per_second": (
                     generated_tokens / (total_ms / 1000) if total_ms else None
                 ),
                 "inter_token_ms": itl_ms,
                 "inter_token_summary_ms": _summary(itl_ms),
+                "decode_mean_breakdown_ms": decode_breakdown,
             },
             "transport": {
                 "edge_to_cloud_bytes": outgoing,

@@ -156,7 +156,7 @@ def pack_session_start(
     chunked_prefill=True, prefill_chunk_size=64, stream_kv_layers=True,
     kv_transfer_dtype="fp16", benchmark_enabled=False,
     model_name=None, torch_dtype=None, overlap_kv_transfer=False,
-    kv_transfer_queue_depth=1,
+    kv_transfer_queue_depth=1, allow_model_load=False,
 ):
     fields = {
         "prefill_edge_layers": prefill_edge_layers,
@@ -171,6 +171,7 @@ def pack_session_start(
         "benchmark_enabled": bool(benchmark_enabled),
         "model_name": model_name,
         "torch_dtype": torch_dtype,
+        "allow_model_load": bool(allow_model_load),
     }
     return bytes([MSG_SESSION_START]) + json.dumps(
         fields, separators=(",", ":")
@@ -197,6 +198,7 @@ def unpack_session_start(data):
     # Defaults retain compatibility with clients from before overlap support.
     fields.setdefault("overlap_kv_transfer", False)
     fields.setdefault("kv_transfer_queue_depth", 1)
+    fields.setdefault("allow_model_load", True)
     return fields
 
 

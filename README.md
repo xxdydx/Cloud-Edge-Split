@@ -22,13 +22,16 @@ Start the cloud server with `AUTH_TOKEN=<your-ngrok-token> python CLOUD.py`, the
 CLOUD_URL=https://your-current-ngrok-url.ngrok-free.app python3 edge_client.py
 ```
 
-The edge model is loaded once and the process waits for prompts until `/quit`, `/exit`, EOF, or Ctrl-C. Each prompt receives fresh edge and cloud KV caches while the model weights and WebSocket connection remain resident.
+The startup warm-up is the only session allowed to download or load cloud weights. `Ready. Type /quit or /exit to stop.` is printed only after the model is resident and a prefill plus decode step has completed. Real prompts reuse those weights and fail immediately instead of triggering a model download if cloud residency was lost. Set `HF_TOKEN` on the cloud to avoid unauthenticated Hub rate limits during the initial warm-up.
+
+The edge model is loaded once and the process then waits for prompts until `/quit`, `/exit`, EOF, or Ctrl-C. Each prompt receives fresh edge and cloud KV caches while the model weights and WebSocket connection remain resident.
 
 ## Benchmarking
 
 When benchmarking is enabled, every prompt prints a short TTFT, inter-token latency, throughput, and byte-count summary. A full JSONL record is appended to `benchmarks/results.jsonl`, including:
 
-- TTFT, inter-token latency distribution, total generation time, and tokens/s
+- TTFT and mean decode breakdowns across edge compute, cloud compute, local processing, session setup, and combined network/tunnel/queue wait
+- Inter-token latency distribution, total generation time, and tokens/s
 - Edge forward, activation encoding, WebSocket, and cloud-forward timings
 - Raw/encoded activation sizes, complete binary-frame sizes, and compression ratio (TCP/TLS/WebSocket framing overhead is excluded)
 - Edge process CPU/RAM and MPS allocation statistics

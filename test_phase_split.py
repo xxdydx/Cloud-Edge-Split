@@ -9,6 +9,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM
 from transformers.cache_utils import DynamicCache
 
 import activation_codec as codec
+from benchmarking import BenchmarkRun
 from cache_migration import (
     assert_cache_lengths,
     extract_kv_delta,
@@ -51,6 +52,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(fields["benchmark_enabled"])
         self.assertFalse(fields["overlap_kv_transfer"])
         self.assertEqual(fields["kv_transfer_queue_depth"], 1)
+        self.assertFalse(fields["allow_model_load"])
         self.assertEqual(fields["model_name"], "example/model")
         self.assertEqual(fields["torch_dtype"], "torch.float16")
 
@@ -64,6 +66,15 @@ class ProtocolTests(unittest.TestCase):
         ))
         self.assertTrue(fields["overlap_kv_transfer"])
         self.assertEqual(fields["kv_transfer_queue_depth"], 2)
+
+    def test_warmup_session_allows_model_loading(self):
+        fields = codec.unpack_session_start(codec.pack_session_start(
+            4,
+            12,
+            2,
+            allow_model_load=True,
+        ))
+        self.assertTrue(fields["allow_model_load"])
 
     def test_prefill_chunk_round_trip(self):
         hidden = torch.randn(1, 7, 16)
@@ -103,6 +114,52 @@ class ProtocolTests(unittest.TestCase):
             ),
             (42, {"done": 1}),
         )
+
+
+class BenchmarkBreakdownTests(unittest.TestCase):
+    def test_breakdown_accounts_for_ttft_and_decode_round(self):
+        run = BenchmarkRun("prompt", SimpleNamespace(), 0.0)
+        run.setup = {
+            "tokenization_ms": 2.0,
+            "session_handshake_ms": 3.0,
+        }
+        run.requests = [
+            {
+                "type": "prefill_chunk",
+                "timings_ms": {
+                    "round_total": 100.0,
+                    "edge_forward": 30.0,
+                    "activation_encode": 5.0,
+                    "websocket_send": 2.0,
+                },
+                "cloud": {
+                    "cloud_prefill_ms": 15.0,
+                    "chunk_total_ms": 20.0,
+                },
+            },
+            {
+                "type": "decode",
+                "timings_ms": {
+                    "round_total": 50.0,
+                    "edge_forward": 10.0,
+                    "activation_encode": 1.0,
+                    "websocket_send": 1.0,
+                },
+                "cloud": {
+                    "cloud_forward_ms": 12.0,
+                    "server_processing_ms": 20.0,
+                },
+            },
+        ]
+
+        ttft, decode = run._latency_breakdowns(110.0)
+
+        self.assertEqual(ttft["network_tunnel_and_queue"], 43.0)
+        self.assertEqual(ttft["cloud_other"], 5.0)
+        self.assertEqual(ttft["client_other"], 5.0)
+        self.assertEqual(decode["network_tunnel_and_queue"], 18.0)
+        self.assertEqual(decode["cloud_other"], 8.0)
+        self.assertEqual(decode["round_total"], 50.0)
 
 
 class CacheTests(unittest.TestCase):

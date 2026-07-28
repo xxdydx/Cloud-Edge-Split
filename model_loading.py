@@ -14,6 +14,22 @@ def num_hidden_layers(model_name):
     return AutoConfig.from_pretrained(model_name).num_hidden_layers
 
 
+def load_causal_lm(model_name, torch_dtype):
+    """Load across Transformers versions before and after the dtype rename."""
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch_dtype,
+        )
+    except TypeError as error:
+        if "unexpected keyword argument 'dtype'" not in str(error):
+            raise
+        return AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+        )
+
+
 def load_partial_model(model_name, torch_dtype, device, start_layer, end_layer,
                         need_embed, need_lm_head):
     """Load model_name, keep only layers[start_layer:end_layer] plus the
@@ -22,7 +38,7 @@ def load_partial_model(model_name, torch_dtype, device, start_layer, end_layer,
     Loading happens on CPU first so the discarded layers/heads are freed
     before anything is moved to a (potentially memory-constrained) GPU.
     """
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch_dtype)
+    model = load_causal_lm(model_name, torch_dtype)
     model.model.layers = nn.ModuleList(model.model.layers[start_layer:end_layer])
     if not need_embed:
         model.model.embed_tokens = None
